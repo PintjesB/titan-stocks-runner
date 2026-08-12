@@ -31,10 +31,6 @@ jobs:
   publish:
     name: Build and push linux/arm64 image
     runs-on: ubuntu-24.04-arm
-    if: >-
-      github.event_name == 'push'
-        ? github.repository == 'PintjesB/titan-stocks-runner' && github.ref == 'refs/heads/main'
-        : true
     permissions:
       contents: read
       packages: write
