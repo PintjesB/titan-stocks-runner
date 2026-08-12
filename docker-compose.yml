@@ -1,47 +1,56 @@
 # Compose contract for the persistent Titan Stocks self-hosted runner.
 #
-# This file deploys one runner container per Docker host. It is the
-# only authoritative definition of the runtime contract; deployment
-# scripts and operational documentation reference the settings here.
+# Runtime architecture
+# ====================
 #
-# Volume layout:
+# The container exposes a single long-running service. It is launched
+# with the image's default entrypoint (tini -> start-runner) and
+# shares three persistent storage locations with the host:
 #
-#   titan-runner-state    Persists the Actions runner ``.runner``,
-#                         ``.credentials*``, and the post-registration
-#                         sanitised diagnostics bundle. Inspected by
-#                         ``deploy.sh status`` to confirm the listener
-#                         is the one it registered.
-#   titan-runner-work     Persists the upstream ``_work`` job workspace
-#                         and the ``_diag`` / ``_data`` log buffers.
-#                         Cleared on operator request only; never by
-#                         the container.
-#   titan-runner-browser  Persists the Playwright browser cache. A
-#                         separate volume keeps the cache out of the
-#                         state volume so a credential rotation cannot
-#                         accidentally invalidate the downloads.
+#   /var/lib/titan-runner/state    Named Docker volume. Holds the
+#                                  Actions runner ``.runner`` and
+#                                  ``.credentials*`` files written by
+#                                  the registration phase and
+#                                  consumed by the listener on every
+#                                  start. Populated by
+#                                  ``deploy.sh register`` once.
 #
-# Operational rules:
+#   /var/lib/titan-runner/work     Host bind mount. Used as GitHub's
+#                                  ``_work`` directory. The host must
+#                                  pre-create the directory and
+#                                  ``chown 1001:1001`` it so service
+#                                  containers started by the host
+#                                  Docker daemon can write into the
+#                                  same workspace the runner sees.
+#
+#   /var/lib/titan-runner/browser  Named Docker volume. Holds the
+#                                  Playwright Chromium browser cache.
+#
+#   /var/run/docker.sock           Host bind mount. The runner is a
+#                                  Docker *client*; the host is the
+#                                  Docker *daemon*.
+#
+# The registration token file is never mounted on the long-running
+# listener container. ``deploy.sh register`` mounts it read-only on a
+# one-shot sidecar, consumes the token, and exits.
+#
+# Operational rules
+# =================
 #
 #   * One runner container per Docker host. Adding a sibling container
 #     collides on host-network ports and corrupts concurrent jobs.
 #   * ``network_mode: host`` so Postgres service containers and
-#     Compose-published localhost ports are reachable from the workflow.
-#   * ``ipc: host`` so the Playwright suite shares the host IPC namespace.
+#     Compose-published localhost ports are reachable from the
+#     workflow.
+#   * ``ipc: host`` so the Playwright suite shares the host IPC
+#     namespace.
 #   * ``init: true`` so ``tini`` is PID 1 and child processes get
 #     proper signal handling and zombie reaping.
-#   * ``no-new-privileges:true`` blocks setuid escalation. The runner
-#     never needs ``privileged: true``; privileged mode and DinD are
-#     explicitly forbidden.
-#   * The Docker socket is bind-mounted read/write and the host
-#     socket's group is re-applied to the runner user inside the
-#     container.
-#   * The deployment pins the image by immutable digest. The
-#     ``:latest`` tag is a convenience pointer; the host must deploy
-#     ``...@sha256:<digest>``.
-#
-# Update procedure: rebuild the runner image whenever the Actions
-# runner or Playwright versions change. Re-tag the published digest and
-# update the host's pinned reference in the deployment environment.
+#   * ``no-new-privileges:true`` blocks setuid escalation. The
+#     runner never needs ``privileged: true``; privileged mode and
+#     DinD are explicitly forbidden.
+#   * The image is always pinned by immutable digest. Mutable tags
+#     are staging-only.
 services:
   runner:
     image: ${TITAN_RUNNER_IMAGE:?TITAN_RUNNER_IMAGE must be pinned by digest}
@@ -62,8 +71,8 @@ services:
       REPO_URL: ${TITAN_RUNNER_REPO_URL:?TITAN_RUNNER_REPO_URL is required}
       RUNNER_NAME: ${TITAN_RUNNER_NAME:-titan-ci}
       RUNNER_LABELS: ${TITAN_RUNNER_LABELS:-self-hosted,linux,ARM64,titan-ci}
-      RUNNER_TOKEN_FILE: ${TITAN_RUNNER_TOKEN_FILE:-/run/secrets/titan-runner-registration-token}
       RUNNER_STATE_DIR: ${TITAN_RUNNER_STATE_DIR:-/var/lib/titan-runner/state}
+      RUNNER_RUNTIME_DIR: ${TITAN_RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}
       RUNNER_WORK_DIR: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
       RUNNER_BROWSER_DIR: ${TITAN_RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}
       RUNNER_ROOT: ${TITAN_RUNNER_ROOT:-/opt/actions-runner}
@@ -73,17 +82,12 @@ services:
       # Operators MUST verify the socket's group ID is granted to the
       # runner user inside the container.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Token volume: bind-mounted read-only with a 0600 file. The
-      # deployment helper ``deploy.sh register`` creates it as a
-      # short-lived ``docker secret``-style file and removes it after
-      # the registration completes.
-      - ${TITAN_RUNNER_TOKEN_FILE:-/run/secrets/titan-runner-registration-token}:${TITAN_RUNNER_TOKEN_FILE:-/run/secrets/titan-runner-registration-token}:ro
-      # Persistent state volume. Holds the Actions runner ``.runner``
-      # and ``.credentials*`` files written by the registration phase.
+      # Persistent state. Holds the Actions runner credentials.
       - titan-runner-state:/var/lib/titan-runner/state
-      # Persistent workspace. Holds the upstream ``_work`` job workspace
-      # and the ``_diag`` / ``_data`` log buffers.
-      - titan-runner-work:/var/lib/titan-runner/work
+      # Persistent host-visible workspace. The host path MUST match
+      # the container path so child service containers started by the
+      # host Docker daemon see the same checkout.
+      - /var/lib/titan-runner/work:/var/lib/titan-runner/work
       # Persistent Playwright browser cache.
       - titan-runner-browser:/var/lib/titan-runner/browser
     healthcheck:
@@ -98,5 +102,4 @@ services:
 
 volumes:
   titan-runner-state:
-  titan-runner-work:
   titan-runner-browser:

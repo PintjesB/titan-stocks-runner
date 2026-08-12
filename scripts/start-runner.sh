@@ -1,45 +1,67 @@
 #!/usr/bin/env bash
 # Start the persistent Titan Stocks GitHub Actions listener.
 #
-# This script is the long-running entrypoint. It assumes the
-# ``register`` phase has already populated the credentials inside
-# ``RUNNER_STATE_DIR`` and refuses to start without them. Updating the
-# runner binary requires a fresh image release; the listener registers
-# with ``--disableupdate`` so even a compromised in-container update
-# attempt cannot swap the binary.
+# Architecture
+# ============
 #
-# Responsibilities:
+# Three storage tiers cooperate at startup. Each tier is recreated or
+# refreshed independently so a container restart never has to fetch a
+# new registration token.
 #
-#   1. Validate the persisted credentials. The runner never has a way
-#      to fetch a new registration token at runtime; a missing or
-#      malformed ``.credentials`` file aborts startup so the host is
-#      alerted instead of looping silently.
-#   2. Re-align the runner user's *supplemental* groups with the bind-
-#      mounted Docker socket's GID. The primary ``runner`` group is
-#      preserved; only the supplemental list is touched.
-#   3. Materialise the image-owned ``/opt/actions-runner`` checkout as
-#      a symlink inside the state volume so the upstream ``run.sh``
-#      finds its sibling files.
-#   4. Execute the upstream ``run.sh --start`` listener continuously
-#      with ``--disableupdate``. The container stays up across job
-#      boundaries so the registration token does not need to be
-#      re-issued.
+#   /opt/actions-runner         Image-owned immutable binary tree
+#                              (e.g. ``run.sh``, ``config.sh``,
+#                              ``runsvc.sh``).
 #
-# Required environment variables (inherited from the registration
-# phase):
+#   /var/lib/titan-runner/state    Persistent volume. Holds the
+#                              Actions runner ``.runner`` and
+#                              ``.credentials*`` files.
 #
-#   RUNNER_NAME           Display name used at registration.
-#   RUNNER_LABELS         Comma-separated capability labels.
-#   RUNNER_STATE_DIR      Credential persistence directory.
-#                         Defaults to ``/var/lib/titan-runner/state``.
-#   RUNNER_WORK_DIR       ``_work`` workspace directory.
-#                         Defaults to ``/var/lib/titan-runner/work``.
-#   RUNNER_BROWSER_DIR    Playwright cache directory.
-#                         Defaults to ``/var/lib/titan-runner/browser``.
-#   RUNNER_ROOT           Override the image-owned checkout.
-#                         Defaults to ``/opt/actions-runner``.
+#   /var/lib/titan-runner/runtime  Materialised tree built fresh on
+#                              every container start by copying the
+#                              immutable image tree and overlaying the
+#                              persistent state. The listener reads
+#                              its configuration from here and writes
+#                              its logs here. A container recreation
+#                              can discard the runtime completely
+#                              without losing the GitHub identity.
 #
-# Exit codes:
+#   /var/lib/titan-runner/work     Host bind mount used as GitHub's
+#                              ``_work`` directory. The same absolute
+#                              path exists on the Docker host so child
+#                              service containers can publish their
+#                              artefacts on the host filesystem.
+#
+#   /var/lib/titan-runner/browser  Persistent Playwright browser cache.
+#
+# On every start the script:
+#
+#   1. Refuses to run without a non-empty ``state/.runner`` and
+#      ``state/.credentials``. The script never fetches a registration
+#      token; the operator must run ``deploy.sh register`` once.
+#   2. Grants the host Docker socket's GID to the runner user as a
+#      *supplemental* group; the primary ``runner`` group is preserved.
+#   3. Rebuilds the runtime tree from ``/opt/actions-runner`` and
+#      overlays the persisted registration files onto it.
+#   4. Launches ``run.sh`` directly via ``gosu`` with no runtime
+#      flags. ``--disableupdate`` is set at registration and persists
+#      in the ``.runner`` manifest.
+#
+# Environment variables
+# =====================
+#
+#   RUNNER_STATE_DIR    Persistent state volume. Default
+#                       ``/var/lib/titan-runner/state``.
+#   RUNNER_RUNTIME_DIR  Disposable runtime tree. Default
+#                       ``/var/lib/titan-runner/runtime``.
+#   RUNNER_WORK_DIR     Host-visible ``_work`` directory. Default
+#                       ``/var/lib/titan-runner/work``.
+#   RUNNER_BROWSER_DIR  Persistent Playwright cache. Default
+#                       ``/var/lib/titan-runner/browser``.
+#   RUNNER_ROOT         Image-owned source tree. Default
+#                       ``/opt/actions-runner``.
+#
+# Exit codes
+# ==========
 #
 #   0  Listener exited cleanly.
 #   1  Required configuration missing or invalid.
@@ -54,6 +76,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/titan-runner/state}"
+RUNNER_RUNTIME_DIR="${RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}"
 RUNNER_WORK_DIR="${RUNNER_WORK_DIR:-/var/lib/titan-runner/work}"
 RUNNER_BROWSER_DIR="${RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}"
 RUNNER_ROOT="${RUNNER_ROOT:-/opt/actions-runner}"
@@ -69,9 +92,13 @@ for path in \
     fi
 done
 
-# Re-apply the host Docker socket's group to the runner user as a
+if [ ! -x "$RUNNER_ROOT/run.sh" ]; then
+    fail "image-owned runner binaries missing from $RUNNER_ROOT; rebuild the image" 1
+fi
+
+# Re-apply the host Docker socket's GID to the runner user as a
 # supplemental group on every start so a host GID change survives a
-# container recreation.
+# container recreation. The primary ``runner`` group is preserved.
 DOCKER_SOCKET="${DOCKER_SOCKET:-/var/run/docker.sock}"
 if [ -S "$DOCKER_SOCKET" ]; then
     host_docker_gid="$(stat -c '%g' "$DOCKER_SOCKET" 2>/dev/null || stat -f '%g' "$DOCKER_SOCKET" 2>/dev/null || echo "")"
@@ -89,30 +116,42 @@ else
     log "warning: $DOCKER_SOCKET is not a socket; Docker CLI calls will fail inside the runner"
 fi
 
-# Re-link the image-owned checkout into the runner user's home. The
-# image stages the binary tree in ``RUNNER_ROOT``; the symlink keeps
-# upstream ``run.sh`` happy without re-extracting the tarball.
-RUNNER_HOME="/home/runner"
-RUNNER_CHECKOUT="$RUNNER_HOME/actions-runner"
-install -d -m 0755 -o runner -g runner "$RUNNER_HOME"
-if [ ! -e "$RUNNER_CHECKOUT/run.sh" ]; then
-    ln -sfn "$RUNNER_ROOT" "$RUNNER_CHECKOUT"
-    chown -h runner:runner "$RUNNER_CHECKOUT"
+# Ensure the persistent directories exist and are owned by runner.
+install -d -m 0750 -o runner -g runner \
+    "$RUNNER_STATE_DIR" \
+    "$RUNNER_RUNTIME_DIR" \
+    "$RUNNER_WORK_DIR" \
+    "$RUNNER_BROWSER_DIR"
+
+# Rebuild the runtime tree from the immutable image tree. The runner
+# reads ``.runner`` and ``.credentials*`` from ``$HOME`` at startup,
+# so setting ``HOME=$RUNNER_RUNTIME_DIR`` makes the overlaid
+# credentials resolve naturally.
+log "materialising runtime tree at $RUNNER_RUNTIME_DIR"
+rm -rf "$RUNNER_RUNTIME_DIR"
+mkdir -p "$RUNNER_RUNTIME_DIR"
+cp -a "$RUNNER_ROOT/." "$RUNNER_RUNTIME_DIR/"
+
+# Overlay persisted registration files onto the runtime tree. The
+# upstream tooling requires ``$HOME/.runner`` and
+# ``$HOME/.credentials`` to exist.
+cp "$RUNNER_STATE_DIR/.runner" "$RUNNER_RUNTIME_DIR/.runner"
+cp "$RUNNER_STATE_DIR/.credentials" "$RUNNER_RUNTIME_DIR/.credentials"
+if [ -f "$RUNNER_STATE_DIR/.credentials_rsaparams" ]; then
+    cp "$RUNNER_STATE_DIR/.credentials_rsaparams" "$RUNNER_RUNTIME_DIR/.credentials_rsaparams"
 fi
 
-# Materialise the Playwright cache directory the listener shares with
-# the registration phase so jobs download browser binaries exactly
-# once.
-install -d -m 0755 -o runner -g runner "$RUNNER_BROWSER_DIR"
-ln -sfn "$RUNNER_BROWSER_DIR" "$RUNNER_HOME/.cache/ms-playwright" 2>/dev/null || true
+chown -R runner:runner "$RUNNER_RUNTIME_DIR"
+chmod 0640 "$RUNNER_RUNTIME_DIR/.runner"
+chmod 0600 "$RUNNER_RUNTIME_DIR/.credentials" \
+          "$RUNNER_RUNTIME_DIR/.credentials_rsaparams" 2>/dev/null || true
+
+# Materialise the Playwright cache link so downloaded browser
+# binaries land in the persistent browser volume.
+ln -sfn "$RUNNER_BROWSER_DIR" /home/runner/.cache/ms-playwright 2>/dev/null || true
 
 log "launching persistent listener; foreground logs follow"
-exec_args=(
-    "$RUNNER_ROOT/run.sh"
-    --start
-    --disableupdate
-)
-
-if ! env HOME="$RUNNER_STATE_DIR" gosu runner "${exec_args[@]}"; then
+if ! env HOME="$RUNNER_RUNTIME_DIR" gosu runner \
+        "$RUNNER_RUNTIME_DIR/run.sh"; then
     fail "listener exited non-zero" 4
 fi

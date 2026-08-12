@@ -103,6 +103,7 @@ RUN apt-get update \
         libasound2t64 \
         libatk-bridge2.0-0t64 \
         libatk1.0-0t64 \
+        libcairo2 \
         libcups2t64 \
         libdbus-1-3 \
         libdrm2 \
@@ -111,6 +112,7 @@ RUN apt-get update \
         libnspr4 \
         libnss3 \
         libpango-1.0-0 \
+        libpangocairo-1.0-0t64 \
         libx11-6 \
         libxcb1 \
         libxcomposite1 \

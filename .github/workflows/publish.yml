@@ -1,16 +1,20 @@
 name: publish
 
-# Build and push the public ARM64 runner image to GHCR.
+# Build, probe, and push the public ARM64 runner image to GHCR.
 #
-# This workflow is the single CI surface for the runner repository.
-# A successful ``linux/arm64`` build on hosted ``ubuntu-24.04-arm`` is
-# the validation step; no scan, SBOM, signature, attestation, or test
-# lane is run.
+# The workflow sequence reflects the operator contract: an image is
+# not considered publishable until the capability probe passes
+# inside the actual image. Network reachability to GitHub is
+# *not* part of the probe; the listener's healthcheck is a separate
+# concern and transient GitHub outages must not fail this build.
 #
-# Output: ``ghcr.io/pintjesb/titan-stocks-runner:latest`` plus the
-# immutable digest surfaced via the ``build`` step's ``outputs.digest``.
-# Deployments pin the digest (e.g. ``...@sha256:<digest>``) and pin
-# the published tag (``latest``) only as a fallback.
+# Output:
+#
+#   ghcr.io/pintjesb/titan-stocks-runner:latest  + immutable digest
+#
+# Deployments pin the image by digest and ignore the mutable tag.
+# The published digest is surfaced via ``steps.build.outputs.digest``
+# so operators can copy it into the deployment notes.
 #
 # Permissions follow GitHub's GHCR publishing guidance documented at
 # https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images
@@ -29,7 +33,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Build and push linux/arm64 image
+    name: Build, probe, and push linux/arm64 image
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -47,18 +51,40 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push linux/arm64 image
+
+      - name: Build linux/arm64 image
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/arm64
-          push: true
-          tags: ghcr.io/pintjesb/titan-stocks-runner:latest
+          push: false
+          load: true
+          tags: |
+            ghcr.io/pintjesb/titan-stocks-runner:latest
+            titan-runner:local
+
+      - name: Run the capability probe against the built image
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+              --entrypoint /usr/local/bin/probe \
+              --network host --ipc host \
+              --security-opt no-new-privileges:true \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -e HOME=/tmp \
+              ghcr.io/pintjesb/titan-stocks-runner:latest \
+              --skip-network
+
+      - name: Push the probed image to GHCR
+        run: |
+          set -euo pipefail
+          docker push ghcr.io/pintjesb/titan-stocks-runner:latest
+
       - name: Report the published digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          printf 'published digest: %s\n' "$DIGEST"
+          printf 'published digest : %s\n' "$DIGEST"
           printf 'pinned reference : ghcr.io/pintjesb/titan-stocks-runner@%s\n' "$DIGEST"

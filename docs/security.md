@@ -44,6 +44,30 @@ runtime. Three rules apply:
   volume; the token is never needed again until the host is
   rebuilt from scratch.
 
+The registration sidecar mounts the token file **read-only** and
+the long-running listener does not mount the token file at all.
+A future re-registration cannot leak into the running listener
+through a shared volume.
+
+## Lifecycle lock
+
+`deploy.sh register`, `deploy.sh up`, and `deploy.sh down` take an
+exclusive `flock` on `/var/lock/titan-runner.lock`. Two operators or
+automations cannot execute these commands simultaneously, so a failed
+re-registration cannot race with an active `up`/`down` sequence.
+
+## State directory hardening
+
+The persistent `state` directory is owned by `runner:runner` with
+mode `0750`. `.runner` is `0640`; `.credentials` and
+`.credentials_rsaparams` are `0600`. The disposable runtime tree is
+rebuilt on every start with the same ownership pattern.
+
+The `diagnostics.txt` summary that lives alongside the credentials
+contains only public metadata (repository URL, labels, paths,
+runner version). It never contains the credentials, the
+registration token, or any application data.
+
 ## Image provenance
 
 The `publish` workflow runs on GitHub-hosted `ubuntu-24.04-arm`,

@@ -1,55 +1,58 @@
 #!/usr/bin/env bash
 # Register the persistent Titan Stocks runner against GitHub.
 #
-# This script is the one-shot lifecycle phase that materialises the
-# runner's Actions credentials inside the ``state`` volume. It runs
-# once during deployment, terminates, and never listens for jobs.
-# The companion ``start-runner`` entrypoint takes over afterwards.
+# Architecture
+# ============
 #
-# Behaviour:
+# Registration is the one phase that requires a fresh registration
+# token. It is run by ``deploy.sh register`` through a one-shot
+# sidecar that mounts the token file read-only. The script:
 #
-#   * Reads the short-lived registration token from
-#     ``RUNNER_TOKEN_FILE`` (a 0600 file mounted read-only into the
-#     container). The token is consumed once and never persisted.
-#   * Registers as a *persistent* listener (``--disableupdate``,
-#     no ``--ephemeral``, no ``--once``). Updates only happen through a
-#     tested image release.
-#   * Re-aligns the runner user's *supplemental* groups with the host
-#     Docker socket's GID without changing the primary ``runner``
-#     group, so ``docker`` commands resolve without sudo.
-#   * Materialises the upstream ``actions-runner`` checkout as a
-#     symlink to ``RUNNER_ROOT`` (``/opt/actions-runner``) so the image
-#     owns the binary while the state volume owns credentials.
-#   * Verifies the Actions runner version installed by the image
-#     matches the version the operator asked GitHub to register against.
-#   * Writes ``.runner``, ``.credentials``, and a sanitised
-#     diagnostics bundle into ``RUNNER_STATE_DIR`` (default
-#     ``/var/lib/titan-runner/state``) so the listener container can
-#     reuse them on every subsequent start.
+#   1. Validates the token file (0600 mode, non-empty contents).
+#   2. Rebuilds a temporary runtime tree at
+#      ``$RUNNER_RUNTIME_DIR`` from the image-owned
+#      ``/opt/actions-runner`` tree.
+#   3. Invokes ``config.sh --replace --disableupdate`` from the
+#      runtime tree so the resulting ``.runner``,
+#      ``.credentials``, and ``.credentials_rsaparams`` files land
+#      inside it.
+#   4. Copies the resulting registration files into the persistent
+#      ``$RUNNER_STATE_DIR`` directory with strict permissions
+#      owned by the ``runner`` user. The token is consumed in
+#      memory and discarded.
+#   5. Cleans up the runtime tree before exiting so the subsequent
+#      ``start-runner`` invocation rebuilds it from image + state.
 #
-# Required environment variables:
+# The script never deletes an existing ``$RUNNER_STATE_DIR`` before
+# writing; ``config.sh --replace`` is the only destructive step and
+# GitHub is the source of truth for credential replacement.
 #
-#   REPO_URL              The repository clone URL the runner targets
-#                         (e.g. ``https://github.com/PintjesB/titan-stocks``).
-#   RUNNER_NAME           The runner's display name. Defaults to
-#                         ``titan-ci-<hostname>`` so duplicates are
-#                         obvious in the GitHub UI.
-#   RUNNER_LABELS         Comma-separated capability labels. Defaults
-#                         to ``self-hosted,linux,ARM64,titan-ci``.
-#   RUNNER_TOKEN_FILE     Path to a 0600 file containing a short-lived
-#                         registration token.
-#   RUNNER_STATE_DIR      Override the credential persistence
-#                         directory. Defaults to
+# Environment variables
+# =====================
+#
+#   REPO_URL              Repository clone URL the runner targets
+#                         (e.g. ``https://github.com/owner/repo``).
+#   RUNNER_NAME           Display name. Defaults to
+#                         ``titan-ci-<hostname>``.
+#   RUNNER_LABELS         Comma-separated capability labels.
+#                         Defaults to
+#                         ``self-hosted,linux,ARM64,titan-ci``.
+#   RUNNER_TOKEN_FILE     Path to a 0600 file containing the
+#                         short-lived registration token.
+#   RUNNER_STATE_DIR      Persistent state directory. Defaults to
 #                         ``/var/lib/titan-runner/state``.
-#   RUNNER_WORK_DIR       Override the Actions runner ``_work``
-#                         directory. Defaults to
+#   RUNNER_RUNTIME_DIR    Disposable runtime tree used during
+#                         registration. Defaults to
+#                         ``/var/lib/titan-runner/runtime``.
+#   RUNNER_WORK_DIR       GitHub ``_work`` directory. Defaults to
 #                         ``/var/lib/titan-runner/work``.
-#   RUNNER_BROWSER_DIR    Override the Playwright cache mount.
-#                         Defaults to ``/var/lib/titan-runner/browser``.
-#   RUNNER_ROOT           Override the image-owned runner checkout.
-#                         Defaults to ``/opt/actions-runner``.
+#   RUNNER_BROWSER_DIR    Playwright cache directory. Defaults to
+#                         ``/var/lib/titan-runner/browser``.
+#   RUNNER_ROOT           Image-owned runner tree. Defaults to
+#                         ``/opt/actions-runner``.
 #
-# Exit codes:
+# Exit codes
+# ==========
 #
 #   0  Runner registered and credentials persisted.
 #   1  Required configuration missing or invalid.
@@ -70,12 +73,13 @@ fi
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,ARM64,titan-ci}"
 RUNNER_NAME="${RUNNER_NAME:-titan-ci-$(hostname)}"
 RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/titan-runner/state}"
+RUNNER_RUNTIME_DIR="${RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}"
 RUNNER_WORK_DIR="${RUNNER_WORK_DIR:-/var/lib/titan-runner/work}"
 RUNNER_BROWSER_DIR="${RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}"
 RUNNER_ROOT="${RUNNER_ROOT:-/opt/actions-runner}"
 
 log "runner_name=$RUNNER_NAME labels=$RUNNER_LABELS"
-log "state_dir=$RUNNER_STATE_DIR work_dir=$RUNNER_WORK_DIR browser_dir=$RUNNER_BROWSER_DIR"
+log "state_dir=$RUNNER_STATE_DIR runtime_dir=$RUNNER_RUNTIME_DIR work_dir=$RUNNER_WORK_DIR"
 
 # Validate the token file. The deployment binds it read-only with a
 # 0600 mode; the script refuses to fall back to anything else.
@@ -93,51 +97,31 @@ if [ -z "$token" ]; then
 fi
 trap 'unset token' EXIT
 
-# Verify the image-owned runner binaries are present and match the
-# version we are about to register against GitHub. A drift between the
-# binary GitHub sees and the binary that actually runs jobs is a
-# reliability hazard and a silent supply-chain window.
-if [ ! -x "$RUNNER_ROOT/run.sh" ]; then
+# Verify the image-owned runner binaries are present.
+if [ ! -x "$RUNNER_ROOT/config.sh" ]; then
     fail "runner binaries missing from $RUNNER_ROOT; rebuild the image" 1
 fi
 
-# Materialise the runner checkout. The image owns the binary tree;
-# the state volume owns the credentials. We bind ``_diag`` and
-# ``_data`` directories alongside the credentials so the listener can
-# start without a fresh checkout.
-install -d -m 0750 -o runner -g runner "$RUNNER_STATE_DIR"
-install -d -m 0750 -o runner -g runner "$RUNNER_WORK_DIR/_work" "$RUNNER_WORK_DIR/_diag" "$RUNNER_WORK_DIR/_data"
-install -d -m 0750 -o runner -g runner "$RUNNER_BROWSER_DIR"
+# Ensure the persistent directories exist with the documented
+# ownership and permissions before touching anything.
+install -d -m 0750 -o runner -g runner \
+    "$RUNNER_STATE_DIR" \
+    "$RUNNER_RUNTIME_DIR" \
+    "$RUNNER_WORK_DIR" \
+    "$RUNNER_BROWSER_DIR"
 
-# Map the bind-mounted Docker socket's group onto the runner user as a
-# supplemental group; the runner user's *primary* group remains
-# ``runner`` so its permissions are unchanged for non-Docker work.
-DOCKER_SOCKET="${DOCKER_SOCKET:-/var/run/docker.sock}"
-if [ -S "$DOCKER_SOCKET" ]; then
-    host_docker_gid="$(stat -c '%g' "$DOCKER_SOCKET" 2>/dev/null || stat -f '%g' "$DOCKER_SOCKET" 2>/dev/null || echo "")"
-    if [ -n "$host_docker_gid" ]; then
-        current_gid="$(getent group "$host_docker_gid" | awk -F: '{print $1}' || true)"
-        if [ -z "$current_gid" ]; then
-            groupadd --gid "$host_docker_gid" docker-host || fail "could not create host docker group" 1
-        fi
-        if ! id -Gn runner | tr ' ' '\n' | grep -qx "$(getent group "$host_docker_gid" | awk -F: '{print $1}')"; then
-            log "adding runner user to supplemental group GID=$host_docker_gid"
-            usermod -a -G "$host_docker_gid" runner
-        fi
-    fi
-else
-    log "warning: $DOCKER_SOCKET is not a socket; Docker CLI calls will fail inside the runner"
-fi
+# Rebuild the runtime tree from the image-owned source tree. Writing
+# into the runtime tree (instead of running ``config.sh`` from
+# ``/opt/actions-runner`` directly) keeps the image immutable.
+log "materialising runtime tree at $RUNNER_RUNTIME_DIR"
+rm -rf "$RUNNER_RUNTIME_DIR"
+mkdir -p "$RUNNER_RUNTIME_DIR"
+cp -a "$RUNNER_ROOT/." "$RUNNER_RUNTIME_DIR/"
+chown -R runner:runner "$RUNNER_RUNTIME_DIR"
 
-# Reset any credentials in the state volume; we register fresh each time.
-rm -f "$RUNNER_STATE_DIR"/.runner \
-      "$RUNNER_STATE_DIR"/.credentials \
-      "$RUNNER_STATE_DIR"/.credentials_rsaparams \
-      "$RUNNER_STATE_DIR"/.runner_pkey
-
-# Hand the upstream config script the state directory as $HOME so the
-# resulting ``.runner`` and ``.credentials*`` land inside the
-# persisted volume.
+# Register the runner. ``config.sh --replace`` removes an existing
+# GitHub registration of the same name; ``--disableupdate`` makes the
+# persisted ``.runner`` refuse subsequent in-container updates.
 log "registering persistent runner against $REPO_URL"
 register_args=(
     --unattended
@@ -149,17 +133,28 @@ register_args=(
     --labels "$RUNNER_LABELS"
     --work "$RUNNER_WORK_DIR"
 )
-if ! env HOME="$RUNNER_STATE_DIR" gosu runner \
-        "$RUNNER_ROOT/config.sh" "${register_args[@]}"; then
+if ! env HOME="$RUNNER_RUNTIME_DIR" gosu runner \
+        "$RUNNER_RUNTIME_DIR/config.sh" "${register_args[@]}"; then
     fail "runner registration failed" 3
 fi
 unset token
 
-# Mirror the persisted credentials into a sanitised diagnostics bundle.
-# The bundle contains the runner name, label set, and capability
-# summaries but never the credentials themselves or the registration
-# token. It is published alongside the credentials so a triage session
-# can verify which registration is mounted.
+# Copy the mutable registration files into the persistent state
+# directory. ``start-runner`` overlays them onto a freshly-built
+# runtime tree on every container start.
+for fname in .runner .credentials .credentials_rsaparams .runner_pkey; do
+    if [ -f "$RUNNER_RUNTIME_DIR/$fname" ]; then
+        cp "$RUNNER_RUNTIME_DIR/$fname" "$RUNNER_STATE_DIR/$fname"
+    fi
+done
+
+chown -R runner:runner "$RUNNER_STATE_DIR"
+chmod 0640 "$RUNNER_STATE_DIR/.runner" 2>/dev/null || true
+chmod 0600 "$RUNNER_STATE_DIR"/.credentials* 2>/dev/null || true
+
+# Save a sanitised diagnostics summary alongside the credentials so
+# deployment audits can confirm which repository and label set is
+# registered without exposing the credentials themselves.
 {
     printf '# titan-runner diagnostics\n'
     printf 'registered_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -168,17 +163,16 @@ unset token
     printf 'runner_labels=%s\n' "$RUNNER_LABELS"
     printf 'runner_root=%s\n' "$RUNNER_ROOT"
     printf 'state_dir=%s\n' "$RUNNER_STATE_DIR"
+    printf 'runtime_dir=%s\n' "$RUNNER_RUNTIME_DIR"
     printf 'work_dir=%s\n' "$RUNNER_WORK_DIR"
     printf 'browser_dir=%s\n' "$RUNNER_BROWSER_DIR"
-    printf 'runner_version=%s\n' "$RUNNER_VERSION"
+    printf 'runner_version=%s\n' "${RUNNER_VERSION:-2.336.0}"
 } > "$RUNNER_STATE_DIR/diagnostics.txt"
 chown runner:runner "$RUNNER_STATE_DIR/diagnostics.txt"
 chmod 0640 "$RUNNER_STATE_DIR/diagnostics.txt"
 
-# Tighten credentials so the listener starts with the same access the
-# registration just produced.
-chown -R runner:runner "$RUNNER_STATE_DIR"
-chmod 0600 "$RUNNER_STATE_DIR"/.credentials "$RUNNER_STATE_DIR"/.credentials_rsaparams 2>/dev/null || true
-chmod 0644 "$RUNNER_STATE_DIR"/.runner 2>/dev/null || true
+# Discard the runtime tree; the persistent state is the only thing
+# the next listener start needs.
+rm -rf "$RUNNER_RUNTIME_DIR"
 
 log "registration complete; credentials persisted to $RUNNER_STATE_DIR"

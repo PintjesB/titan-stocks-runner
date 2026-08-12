@@ -5,7 +5,30 @@ This procedure covers the first-time deployment of a persistent
 already run Docker Engine with the Compose v2 plugin and Buildx
 available on the `PATH`.
 
-## 1. Bootstrap a short-lived registration token
+## 1. Prepare host paths
+
+The runner distinguishes three storage tiers; pre-create the host
+paths once:
+
+```bash
+sudo install -d -m 0750 -o 1001 -g 1001 \
+    /var/lib/titan-runner/state \
+    /var/lib/titan-runner/runtime \
+    /var/lib/titan-runner/work \
+    /var/lib/titan-runner/browser
+```
+
+* **`state`** — persistent. Holds the GitHub-issued Actions runner
+  credentials and a sanitised diagnostics summary.
+* **`runtime`** — disposable. Materialised from the image on every
+  container start; recreated by `start-runner.sh`.
+* **`work`** — host bind mount. Used as GitHub's `_work` directory.
+  The same absolute path **must** exist inside the container so the
+  host Docker daemon can publish child service-container artefacts
+  into the runner's checkout.
+* **`browser`** — persistent. Holds the Playwright Chromium cache.
+
+## 2. Bootstrap a short-lived registration token
 
 GitHub registration tokens are valid for about an hour. The token is
 read once by the `register` lifecycle phase and then deleted; it is
@@ -20,10 +43,9 @@ chmod 0600 /run/secrets/titan-runner-registration-token
 ```
 
 A SOPS-decrypted file, an AWS Secrets Manager `get-secret-value`
-output, or a HashiCorp Vault read are equally valid; the
-`register.sh` script just needs a 0600 file at the path it is given.
+output, or a HashiCorp Vault read are equally valid.
 
-## 2. Pull the image
+## 3. Pull the image
 
 The image is published as `ghcr.io/pintjesb/titan-stocks-runner:latest`.
 Resolve the immutable digest that backs the tag, then pin by digest:
@@ -33,17 +55,12 @@ docker buildx imagetools inspect ghcr.io/pintjesb/titan-stocks-runner:latest
 docker pull ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest>
 ```
 
-Any host that can pull from `ghcr.io` can resolve the digest. The
-image is public precisely so the digest pin is decoupled from any
-GitHub App installation.
+## 4. Register once and persist credentials
 
-## 3. Register once and persist credentials
-
-The `register` action is a one-shot sidecar. It consumes the token
+`deploy.sh register` is a one-shot sidecar. It consumes the token
 file, registers as a persistent listener with `--disableupdate`,
-and copies the resulting `.runner` and `.credentials*` files into
-the `titan-runner-state` named volume. The volume outlives the
-sidecar so subsequent starts do not need a token.
+materialises a temporary runtime tree from the image, writes the
+resulting credentials into `titan-runner-state`, then exits:
 
 ```bash
 TITAN_RUNNER_IMAGE=ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest> \
@@ -58,13 +75,14 @@ The sidecar refuses to run if:
 * `TITAN_RUNNER_REPO_URL` is not set (the image refuses to
   hard-code the consumer).
 * `TITAN_RUNNER_TOKEN_FILE` does not exist or is not mode `0600`.
+* A `titan-runner` listener is already running — run
+  `deploy.sh down` first.
 * The image does not contain the `RUNNER_ROOT` binaries.
-* The Docker socket is missing (no fallback is possible).
 
-When the sidecar exits, `deploy.sh register` returns 0 and prints a
-`registration complete` line.
+After successful registration the script logs the diagnostic summary
+that is persisted to `state/diagnostics.txt`.
 
-## 4. Shred the bootstrap token
+## 5. Shred the bootstrap token
 
 The registration used a one-time credential. Delete it:
 
@@ -72,16 +90,15 @@ The registration used a one-time credential. Delete it:
 shred -u /run/secrets/titan-runner-registration-token
 ```
 
-The persisted credentials are stored in
-`titan-runner-state:/var/lib/titan-runner/state/.credentials`.
-Re-issuing a token is only required when the host rotates the
-registration, when the repository is transferred, when GitHub
-invalidates the credentials (after 30 days of inactivity), or when
-the host is rebuilt from scratch.
+The persisted credentials live in
+`titan-runner-state:/var/lib/titan-runner/state/.credentials`. A
+fresh token is only required when the host is rebuilt from scratch
+or when GitHub invalidates the secret (typically after more than 30
+days of inactivity).
 
-## 5. Start the persistent listener
+## 6. Start the persistent listener
 
-The `up` action refuses to start without configured state, so the
+`deploy.sh up` refuses to start without configured state so the
 runner never boots into a loop that asks GitHub for a fresh token.
 
 ```bash
@@ -90,47 +107,60 @@ TITAN_RUNNER_REPO_URL=https://github.com/PintjesB/titan-stocks \
     ./deploy.sh up
 ```
 
+On start the listener:
+
+1. Validates `state/.runner` and `state/.credentials` are present.
+2. Grants the host Docker socket's group ID to the `runner` user as
+   a **supplemental** group (the primary `runner` group is preserved).
+3. Copies the immutable `RUNNER_ROOT` tree into
+   `/var/lib/titan-runner/runtime` and overlays the persisted
+   credentials onto it.
+4. Launches the upstream `run.sh` directly via `gosu runner` with
+   no runtime flags — `--disableupdate` is set at registration and
+   persists in the `.runner` manifest.
+
 The container restarts on host reboot because the deployment uses
 `restart: unless-stopped`. The GitHub-issued long-lived secret in
-`/var/lib/titan-runner/state/.credentials` covers every restart; the
-runner never asks for a new token unless an operator explicitly
-re-runs `register`.
+`/var/lib/titan-runner/state/.credentials` covers every restart;
+the token file is never mounted on the long-running container.
 
-## 6. Confirm the listener
-
-The `status` subcommand surfaces both the container state and the
-IDs of the persisted volumes:
+## 7. Confirm the listener
 
 ```bash
 ./deploy.sh status
 ./deploy.sh logs --tail=200 --follow
 ```
 
-In the GitHub UI the runner appears under the repository's
-**Settings &rarr; Actions &rarr; Runners** list with the configured
-name and the
+`deploy.sh status` reports the runner image digest, the listener
+container and process state, the Docker socket reachability, the
+state volume contents, and the token file presence.
+
+In the GitHub UI the runner appears under **Settings &rarr; Actions
+&rarr; Runners** with the configured name and the
 `self-hosted`, `linux`, `ARM64`, `titan-ci` labels.
 
-## 7. Tear down (host rotation)
+## 8. Tear down (host rotation)
 
-When a host is rotated, the state volume is the only piece that
-must be preserved:
+When a host is rotated, **only the `state` volume and the host
+work/browser paths must be preserved** — the runtime tree and the
+running container are disposable.
 
 ```bash
-# Old host: stop the container, do NOT delete the volume.
+# Old host: stop the container. State and work paths remain on disk.
 ./deploy.sh down
-docker volume inspect titan-runner-state
 
-# New host: re-create the volume from the backup, then `up` without
-# re-registering.
-docker volume create titan-runner-state
-docker run --rm \
-    -v titan-runner-state:/data \
-    -v "$PWD/state-backup":/backup:ro \
-    alpine:3.20 cp -a /backup/. /data/
+# New host: pre-create the directories, transfer /var/lib/titan-runner/state
+# and /var/lib/titan-runner/{work,browser} (e.g. via rsync, btrfs send,
+# or a backup volume), then start without re-registering.
+sudo install -d -m 0750 -o 1001 -g 1001 \
+    /var/lib/titan-runner/state \
+    /var/lib/titan-runner/runtime \
+    /var/lib/titan-runner/work \
+    /var/lib/titan-runner/browser
+# ... (restore state + work + browser) ...
 TITAN_RUNNER_IMAGE=ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest> \
 TITAN_RUNNER_REPO_URL=https://github.com/PintjesB/titan-stocks \
     ./deploy.sh up
 ```
 
-A token is only necessary when the state volume is empty.
+A token is only necessary when the `state` volume is empty.
