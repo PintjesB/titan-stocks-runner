@@ -122,11 +122,12 @@ docker pull ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest>
 # error: requested access to the resource is denied
 ```
 
-The package is not public. The
-`make-public-on-first-publish` workflow flips the visibility on
-the first successful run; if it was deleted from the
-`workflow_run` log, re-trigger the publish workflow. After the
-flip succeeds, retry the pull.
+GitHub creates personal-account GHCR packages as private by default.
+Open
+[`PintjesB/titan-stocks-runner`'s package settings](https://github.com/users/PintjesB/packages/container/titan-stocks-runner/settings),
+choose **Danger Zone &rarr; Change package visibility**, and set it
+to **Public**. The setting is one-time; subsequent publishes keep the
+public visibility automatically. After the change, retry the pull.
 
 ## Cycle: container restarts, then drains immediately
 

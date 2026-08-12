@@ -25,10 +25,11 @@ output, or a HashiCorp Vault read are equally valid; the
 
 ## 2. Pull the image
 
-The image is published as both a moving `edge` tag and immutable
-`vX.Y.Z` tags. Pin the deployment by digest:
+The image is published as `ghcr.io/pintjesb/titan-stocks-runner:latest`.
+Resolve the immutable digest that backs the tag, then pin by digest:
 
 ```bash
+docker buildx imagetools inspect ghcr.io/pintjesb/titan-stocks-runner:latest
 docker pull ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest>
 ```
 

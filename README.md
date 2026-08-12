@@ -13,13 +13,12 @@ for [PintjesB/titan-stocks](https://github.com/PintjesB/titan-stocks).
   `probe`, `register`, `up`, `status`, `logs`, `down`).
 * **Contract tests** &mdash; focused Python and shell tests that pin
   the documented operator contract.
-* **Hosted CI** &mdash; a hosted `ubuntu-24.04-arm` pipeline that
-  rebuilds the real `linux/arm64` image, runs the capability probe,
-  scans the image, and generates a CycloneDX SBOM.
-* **Publishing** &mdash; a `publish` workflow that ships moving
-  `edge`, commit-addressed `sha-<short>`, and immutable `vX.Y.Z` tags
-  to `ghcr.io/pintjesb/titan-stocks-runner` and signs every release
-  with keyless cosign signatures and SPDX SBOM attestations.
+* **Publishing** &mdash; a single `publish` workflow that builds and
+  pushes the public `linux/arm64` image as
+  `ghcr.io/pintjesb/titan-stocks-runner:latest`. The CI surface is a
+  hosted `ubuntu-24.04-arm` build; a successful build is the
+  validation step. The published digest is reported in the workflow
+  output so deployments can pin `latest@sha256:<digest>`.
 
 The image is publicly pullable. Running the container still requires
 the operator to supply a GitHub Actions registration token; the
@@ -118,7 +117,7 @@ reproduction or reuse rights are granted by publication.**
   relationship.
 * `.dockerignore` excludes everything except the documentation,
   scripts, and Dockerfile so every published layer is minimal.
-* Pull requests and `main` builds run on hosted
+* The hosted `publish` workflow runs on
   `ubuntu-24.04-arm` so CI does not depend on the runner image
   itself.
 

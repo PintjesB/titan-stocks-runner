@@ -32,12 +32,12 @@
 # the host socket's group ID is mapped onto the runner user at start
 # time so the docker CLI can reach the daemon without sudo.
 
-ARG UBUNTU_BASE_DIGEST=sha256:6017f11cc582161b1c91b1bb00d47a8479086c207475c3a89f53af602dc26110
+ARG UBUNTU_BASE_DIGEST=sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
 FROM ubuntu:24.04@${UBUNTU_BASE_DIGEST} AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUNNER_VERSION=2.336.0
-ARG RUNNER_SHA256=4d6317b0f6cb9b0d4f0c5f4a0e3f0a3f0b8d7e9b3a8c7d6e5f4a3b2c1d0e9f8a
+ARG RUNNER_SHA256=58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1
 ARG PLAYWRIGHT_VERSION=1.61.1
 
 ENV LANG=C.UTF-8 \
@@ -60,12 +60,12 @@ ENV LANG=C.UTF-8 \
 # for the ``init: true`` Compose contract so the runner child
 # processes get proper signal forwarding and zombie reaping.
 #
-# ``ca-certificates`` ships the Mozilla CA bundle so GitHub API calls,
-# ``cosign`` verification, and Playwright browser downloads all use a
-# trusted store. ``gnupg`` is required for the NodeSource apt keyring
-# pattern; ``jq`` powers the runner registration token exchange.
-# ``gosu`` is required for the persistent listener to drop from the
-# root entrypoint to the unprivileged ``runner`` user.
+# ``ca-certificates`` ships the Mozilla CA bundle so GitHub API calls
+# and Playwright browser downloads all use a trusted store. ``gnupg``
+# is required for the NodeSource apt keyring pattern; ``jq`` powers
+# the runner registration token exchange. ``gosu`` is required for the
+# persistent listener to drop from the root entrypoint to the
+# unprivileged ``runner`` user.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \

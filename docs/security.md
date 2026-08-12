@@ -46,28 +46,17 @@ runtime. Three rules apply:
 
 ## Image provenance
 
-Every published image is signed with a keyless cosign signature and
-attested with an SPDX SBOM. The release workflow also verifies the
-signature and attestation immediately after signing; verify a
-downloaded digest with:
+The `publish` workflow runs on GitHub-hosted `ubuntu-24.04-arm`,
+checks out the source from this repository, and pushes the built
+manifest under the `PintjesB/titan-stocks-runner` GHCR package. The
+immutable digest surfaces in the build step's output so the host can
+pin `ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest>` and ignore
+the mutable `:latest` tag.
 
-```bash
-cosign verify \
-  --certificate-identity 'https://github.com/PintjesB/titan-stocks-runner/.github/workflows/publish.yml@refs/tags/vX.Y.Z' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest>
-```
-
-## Vulnerability scanning
-
-* Pull requests and `main` builds run
-  [`aquasecurity/trivy-action`](https://github.com/aquasecurity/trivy-action)
-  with `severity: HIGH,CRITICAL` and `ignore-unfixed: true`.
-  Findings at those severities fail the job.
-* Release-tag builds re-scan the immutable digest that was just
-  published so the failure trips before any operator can pull it.
-* The pipeline does not depend on the runner image itself; it
-  runs on hosted `ubuntu-24.04-arm`.
+The runner image is intentionally public. Anonymous pulls from
+ghcr.io are the only image-verification path; the workflow does not
+attach keyless cosign signatures, SBOM attestations, or any other
+provenance artifact.
 
 ## Source-code reuse
 

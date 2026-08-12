@@ -5,13 +5,8 @@ The runner version is tracked by the `RUNNER_VERSION` and
 the runner never self-updates, so the only way to receive a new
 release is to publish a fresh image.
 
-## Detecting that an upgrade is due
-
-* The weekly `upstream-check` workflow compares the pinned version
-  with the latest `actions/runner` release. When the major or
-  minor drifts, it opens a `runner-drift` issue in this repository.
-* GitHub ends Actions Runner support 30 days after a new release.
-  Plan a tested image release within that window.
+GitHub ends Actions Runner support 30 days after a new release. Plan
+a tested image release within that window.
 
 ## Publishing a new version
 
@@ -29,19 +24,11 @@ release is to publish a fresh image.
    resolves; the application lockfile pins the actual binary used
    in workflow runs.
 
-3. Open a pull request. The hosted `ubuntu-24.04-arm` CI rebuilds
-   the real `linux/arm64` image and runs the probe.
-
-4. Merge to `main` &mdash; the `publish` workflow pushes a moving
-   `edge` tag and a `sha-<short>` tag.
-
-5. Tag the release. Use `git tag -s vX.Y.Z` to create a signed tag
-   the publish workflow will pick up. The workflow pushes
-   `vX.Y.Z`, `X.Y`, `sha-<short>`, and (when on `main`) `edge`
-   tags with a keyless cosign signature and an SPDX SBOM
-   attestation.
-
-6. Note the published digest in the deployment log.
+3. Push to `main`. The hosted `publish` workflow rebuilds the real
+   `linux/arm64` image and pushes
+   `ghcr.io/pintjesb/titan-stocks-runner:latest`. The workflow
+   reports the immutable digest in its output; copy it into the
+   deployment notes.
 
 ## Updating the CI host
 
@@ -55,14 +42,13 @@ TITAN_RUNNER_REPO_URL=https://github.com/PintjesB/titan-stocks \
 running container with `--force-recreate` and the listener picks up
 the existing credentials in `titan-runner-state`. No new
 registration token is needed because the
-`RUNNER_VERSION=${RUNNER_VERSION}` and the GitHub-issued secret in
-`.credentials` are both image-only secrets; they survive a container
-recreation on the same state volume.
+GitHub-issued secret in `.credentials` is image-only and survives a
+container recreation on the same state volume.
 
 ## Rolling back
 
-Rollbacks are an image switch, not a state mutation. Re-deploy
-with the previous digest:
+Rollbacks are an image switch, not a state mutation. Re-deploy with
+the previous digest:
 
 ```bash
 TITAN_RUNNER_IMAGE=ghcr.io/pintjesb/titan-stocks-runner@sha256:<previous-digest> \
@@ -70,13 +56,13 @@ TITAN_RUNNER_REPO_URL=https://github.com/PintjesB/titan-stocks \
     ./deploy.sh up
 ```
 
-GitHub does not allow mutating an existing version tag
-(`vX.Y.Z`); operators always deploy by digest. The previous
-published digest is still available from GHCR.
+The `:latest` tag is a convenience pointer; operators always deploy
+by digest. GHCR keeps every previously published image, so the
+rollback target is still pullable.
 
 The `down` action is intentionally non-destructive &mdash; it does
-not delete the state, work, or browser volumes. A red badge on the
-release never requires re-registering the runner.
+not delete the state, work, or browser volumes. A red build on
+`main` never requires re-registering the runner.
 
 ## When to re-register
 

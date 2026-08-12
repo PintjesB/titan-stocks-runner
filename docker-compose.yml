@@ -35,8 +35,9 @@
 #   * The Docker socket is bind-mounted read/write and the host
 #     socket's group is re-applied to the runner user inside the
 #     container.
-#   * The deployment pins the image by immutable digest. Mutable tags
-#     (``edge``) are staging-only.
+#   * The deployment pins the image by immutable digest. The
+#     ``:latest`` tag is a convenience pointer; the host must deploy
+#     ``...@sha256:<digest>``.
 #
 # Update procedure: rebuild the runner image whenever the Actions
 # runner or Playwright versions change. Re-tag the published digest and
