@@ -1,0 +1,30 @@
+# Tooling
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Test and coverage outputs
+coverage/
+.coverage*
+.cache/
+artifacts/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime artifacts
+dist/
+build/
+node_modules/
+.venv/
+
+# Secrets and host configuration
+.env
+.env.*
+!.env.example
+docker-config/
+tokens/
+*.token

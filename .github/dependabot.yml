@@ -1,0 +1,17 @@
+# Dependabot keeps the documentation links and other GitHub-Actions
+# update surfaces current. The runner image itself is rebuilt by the
+# upstream-check workflow when GitHub publishes a new Actions Runner
+# release; operators review and merge that release rather than letting
+# Dependabot touch it.
+
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
