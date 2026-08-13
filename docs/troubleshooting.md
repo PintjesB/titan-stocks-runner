@@ -51,20 +51,19 @@ The file must be mode `0600` or stricter because
 chmod 0600 /path/.env
 ```
 
-## Registration sidecar fails on `docker compose up -d`
+## Registration fails during `docker compose up -d`
 
 ```
-container titan-runner-register exited with status 2
+titan-runner exited with status 2
 ```
 
-The `register` service is idempotent and exits successfully on
-the steady-state path. A non-zero exit means the persisted
-identity is missing, partial, or has drifted and
-`TITAN_RUNNER_TOKEN` was empty or unusable. Inspect the
-sidecar logs:
+The single runner container performs registration before starting
+the listener. A non-zero exit means the persisted identity is
+missing, partial, or has drifted and `TITAN_RUNNER_TOKEN` was empty
+or unusable. Inspect the runner logs:
 
 ```bash
-docker compose logs register
+docker compose logs runner
 ```
 
 The expected actionable messages are:
@@ -80,9 +79,10 @@ The expected actionable messages are:
   runner name, or labels drifted; refresh the token and
   re-run.
 
-The listener is gated on the sidecar's success, so the stack
-remains `down` after a failed registration; the operator can
-re-run `docker compose up -d` once the configuration is fixed.
+The listener is launched only after the internal registration phase
+succeeds, so the single container remains stopped (or retries under
+`restart: unless-stopped`) after a failed registration. Re-run
+`docker compose up -d` once the configuration is fixed.
 The script never writes a backup unless it has a non-empty
 token to attempt a re-registration; a missing-token failure
 leaves the persistent state untouched.
@@ -281,7 +281,7 @@ change, retry the pull.
 Another lifecycle command is already running.
 ```
 
-Another `deploy.sh register`, `up`, or `down` is in flight,
+Another `deploy.sh up` or `down` is in flight,
 or a stale lock file at `/var/lock/titan-runner.lock` was not
 released. Inspect with:
 
@@ -307,9 +307,9 @@ manifest.
 
 ## Old offline GitHub runner entry persists
 
-When migrating from the previous `deploy.sh register` flow
-(direct `docker run --rm`) to the current `docker compose up
--d` flow, the previous registration may remain visible in the
+When migrating from an older one-shot registration flow to the
+current `docker compose up -d` flow, the previous registration may
+remain visible in the
 GitHub UI under **Settings &rarr; Actions &rarr; Runners** as
 an offline entry. The new registration re-uses the same runner
 name and labels and cannot remove the old offline entry

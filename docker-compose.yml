@@ -1,33 +1,4 @@
 services:
-  register:
-    image: ${TITAN_RUNNER_IMAGE:?TITAN_RUNNER_IMAGE must be pinned by digest}
-    container_name: titan-runner-register
-    restart: "no"
-    entrypoint: ["/usr/local/bin/register"]
-    security_opt:
-      - no-new-privileges:true
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      REPO_URL: ${TITAN_RUNNER_REPO_URL:?TITAN_RUNNER_REPO_URL is required}
-      RUNNER_NAME: ${TITAN_RUNNER_NAME:-titan-ci}
-      RUNNER_LABELS: ${TITAN_RUNNER_LABELS:-titan-ci}
-      RUNNER_STATE_DIR: ${TITAN_RUNNER_STATE_DIR:-/var/lib/titan-runner/state}
-      RUNNER_RUNTIME_DIR: ${TITAN_RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}
-      RUNNER_WORK_DIR: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
-      RUNNER_BROWSER_DIR: ${TITAN_RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}
-      RUNNER_ROOT: ${TITAN_RUNNER_ROOT:-/opt/actions-runner}
-      # Only the one-shot registration service receives the token.
-      RUNNER_TOKEN: ${TITAN_RUNNER_TOKEN:-}
-    volumes:
-      - titan-runner-state:/var/lib/titan-runner/state
-      # Source and target must remain identical for host-Docker workspaces.
-      - type: bind
-        source: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
-        target: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
-        bind:
-          create_host_path: true
-
   runner:
     image: ${TITAN_RUNNER_IMAGE:?TITAN_RUNNER_IMAGE must be pinned by digest}
     container_name: titan-runner
@@ -35,10 +6,6 @@ services:
     security_opt:
       - no-new-privileges:true
     privileged: false
-    depends_on:
-      register:
-        condition: service_completed_successfully
-        restart: true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     shm_size: "2gb"
@@ -51,6 +18,9 @@ services:
       RUNNER_WORK_DIR: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
       RUNNER_BROWSER_DIR: ${TITAN_RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}
       RUNNER_ROOT: ${TITAN_RUNNER_ROOT:-/opt/actions-runner}
+      # The startup entrypoint consumes this token during registration,
+      # unsets it, and then execs the persistent listener.
+      RUNNER_TOKEN: ${TITAN_RUNNER_TOKEN:-}
       ACTIONS_RUNNER_HOOK_JOB_STARTED: ${ACTIONS_RUNNER_HOOK_JOB_STARTED:-/var/lib/titan-runner/runtime/.hooks/PreJob.sh}
       ACTIONS_RUNNER_HOOK_JOB_COMPLETED: ${ACTIONS_RUNNER_HOOK_JOB_COMPLETED:-/var/lib/titan-runner/runtime/.hooks/PostJob.sh}
     volumes:
@@ -72,7 +42,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      # Registration may contact GitHub before the listener process
+      # exists; give that startup phase enough time to complete.
+      start_period: 2m
     stop_grace_period: 30s
     networks:
       - titan-runner-net

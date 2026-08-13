@@ -62,7 +62,7 @@ directory is an identical VM/container bind mount: the source
 and target both resolve to
 `${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` so the
 VM's Docker daemon view matches the listener's view; Compose
-creates the host path on demand and the registration sidecar
+creates the host path on demand and startup registration
 establishes `runner:runner` ownership before the listener
 starts. The contract rejects named-volume workspaces and bind
 mounts whose source and target differ.
@@ -103,8 +103,7 @@ IPC namespace.
 | --- | --- | --- |
 | `build`   | none | Build the runner image for the native host architecture (`linux/amd64` or `linux/arm64`) with Buildx and load it into the local daemon. |
 | `probe`   | none | Run `probe.sh` in a one-shot container with the Docker socket bind-mounted. Uses `--entrypoint /usr/local/bin/probe`. Runs on ordinary bridge networking with the native platform. Passes `EXPECTED_ARCH` so the probe can reject an emulated/mismatched Docker daemon before the rest of the contract runs. The probe sidecar never receives the registration token. |
-| `register`| exclusive | Invoke the Compose registration service with `--rm`. The short-lived token is forwarded by Compose as `RUNNER_TOKEN`, unset before `config.sh` returns, and never persisted. Refuses if a listener is running. Idempotent: a matching persisted identity exits without contacting GitHub. Identity drift is automatically detected and a fresh token triggers a transactional local re-registration; the previous credentials are kept under `state/.backup-<epoch>` until the new ones are validated. Local rollback is best-effort; the GitHub-side runner record is not transactionally restored after `config.sh --replace`. |
-| `up`      | exclusive | `docker compose up -d --force-recreate`. The registration sidecar runs first; the listener only starts once `register` exits successfully. The listener's `depends_on.register.restart: true` declaration additionally causes the listener to reload its persisted credentials whenever a successful re-registration completes. The token may be absent after the first registration; the sidecar still exits successfully because the persisted identity already matches. |
+| `up`      | exclusive | `docker compose up -d --force-recreate --remove-orphans`. The single runner container runs the idempotent registration phase first, then starts the listener. The token may be absent after the first registration because matching persisted identity skips GitHub. Identity drift automatically triggers transactional local re-registration before the listener starts. |
 | `down`    | exclusive | `docker compose down --remove-orphans`. State, work, and browser volumes remain on disk. |
 | `status`  | none | Report runner image digest, host architecture and platform, container state, listener process, docker socket reachability, state volume contents, bridge network mode, `shm_size`, `host.docker.internal` alias resolution, and absence of both `RUNNER_TOKEN` and `TITAN_RUNNER_TOKEN` from the listener environment. |
 | `logs`    | none | Tail the runner logs (`docker compose logs`). |
@@ -112,7 +111,7 @@ IPC namespace.
 Architecture check: `deploy.sh` maps `uname -m` to `amd64` or
 `arm64` and aborts immediately on any other host architecture.
 
-Lifecycle lock: `register`, `up`, and `down` take an exclusive
+Lifecycle lock: `up` and `down` take an exclusive
 flock on `${TITAN_RUNNER_LOCK_FILE:-/var/lock/titan-runner.lock}`.
 `status` and `logs` skip the lock so operators can inspect the
 deployment while a long command runs in another shell. The
@@ -141,10 +140,10 @@ The current allowlist:
 | `TITAN_RUNNER_REPO_URL` | Consumer repository URL |
 | `TITAN_RUNNER_NAME` | Display name |
 | `TITAN_RUNNER_LABELS` | Custom capability label list (`titan-ci`; GitHub auto-attaches `self-hosted`, `linux`, and `X64` / `ARM64`) |
-| `TITAN_RUNNER_TOKEN` | Registration token (only the `register` service sees it; never the listener) |
+| `TITAN_RUNNER_TOKEN` | Registration token (the runner startup phase sees it; the listener process does not) |
 | `TITAN_RUNNER_STATE_DIR` | Persistent state path |
 | `TITAN_RUNNER_RUNTIME_DIR` | Disposable runtime path |
-| `TITAN_RUNNER_WORK_DIR` | Named work volume path |
+| `TITAN_RUNNER_WORK_DIR` | Host bind-mount path shared at the same absolute path inside the runner |
 | `TITAN_RUNNER_BROWSER_DIR` | Playwright cache path |
 | `TITAN_RUNNER_ROOT` | Image-owned runner tree path |
 | `TITAN_RUNNER_STATE_VOLUME` | Named volume for state |
@@ -158,7 +157,7 @@ Explicitly exported values, including deliberate empty overrides
 
 ## Persistent state layout
 
-The `register` sidecar writes the following files into
+The internal registration phase writes the following files into
 `$RUNNER_STATE_DIR` (default `/var/lib/titan-runner/state`) with
 strict permissions:
 
@@ -257,7 +256,7 @@ When the operator wants to add additional custom labels (for
 example, `titan-ci,foo` for an experiment), edit
 `TITAN_RUNNER_LABELS` in `.env`, set a fresh
 `TITAN_RUNNER_TOKEN`, then run `docker compose up -d`. The
-registration sidecar detects the drift between the persisted and
+internal registration phase detects the drift between the persisted and
 the requested identity, takes a transactional local backup of
 the existing credentials, and re-registers against GitHub. An
 ordinary `config.sh --replace` commit error restores the
@@ -274,9 +273,9 @@ To migrate the runner to a new repository, update
 `TITAN_RUNNER_TOKEN`, then run `docker compose up -d`. The
 GitHub-issued secret in `.credentials` is invalidated by GitHub
 whenever the registration moves between repositories, so a fresh
-token is required. The listener's
-`depends_on.register.restart: true` declaration reloads the
-persisted credentials once the re-registration completes.
+token is required. The startup entrypoint reloads the persisted
+credentials once the re-registration completes, then launches the
+listener.
 
 > **Note:** if the previous registration is left as an offline
 > entry in the GitHub UI under **Settings &rarr; Actions &rarr;

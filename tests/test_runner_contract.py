@@ -21,12 +21,11 @@ Lifecycle invariants covered here:
   download attempt.
 * The persistent state layout is named volume + host bind mount,
   not a single container filesystem.
-* ``deploy.sh probe`` and ``deploy.sh register`` use
-  ``--entrypoint`` to override the image's default listener
-  entrypoint.
-* ``deploy.sh up`` does not mount the registration token file and
-  does not propagate ``RUNNER_TOKEN`` into the listener
-  environment.
+* ``deploy.sh probe`` uses ``--entrypoint`` to override the image's
+  default listener entrypoint; ``deploy.sh up`` is the sole
+  registration-and-start lifecycle command.
+* The single Compose service passes ``RUNNER_TOKEN`` to startup,
+  and ``start-runner.sh`` unsets it before launching the listener.
 * The listener runs only ``run.sh`` with no runtime
   ``--start``/``--disableupdate`` flags.
 * The Compose contract mounts the host work directory at the same
@@ -319,7 +318,7 @@ def test_register_materialises_runtime_and_persists_credentials_separately() -> 
 
 
 def test_register_does_not_change_runner_primary_group() -> None:
-    """The register sidecar does not change the runner user's primary group."""
+    """The registration phase does not change the runner user's primary group."""
     text = _read(REGISTER_SCRIPT)
     assert "usermod --gid" not in text, (
         "register.sh must NOT change the runner user's primary group"
@@ -498,10 +497,10 @@ def test_compose_binds_work_directory_at_same_absolute_path() -> None:
     )
 
 
-def test_compose_does_not_mount_registration_token() -> None:
+def test_compose_passes_startup_token_without_file_mount() -> None:
     """The Compose contract MUST NOT mount a registration token file
-    on the long-running listener. The token exists only for the
-    one-shot ``register`` Compose service."""
+    on the runner. The startup token is passed as an environment value
+    and consumed before the listener process is launched."""
     text = _read(COMPOSE_FILE)
     assert "registration-token" not in text, (
         "docker-compose.yml must not mount a registration token file"
@@ -512,17 +511,8 @@ def test_compose_does_not_mount_registration_token() -> None:
     assert "RUNNER_TOKEN_FILE" not in text, (
         "docker-compose.yml must not propagate RUNNER_TOKEN_FILE"
     )
-    # ``RUNNER_TOKEN`` and ``TITAN_RUNNER_TOKEN`` MUST never appear
-    # as keys under the ``runner`` service's ``environment:`` block
-    # because the long-running listener authenticates with the
-    # GitHub-issued long-lived secret persisted by ``register``.
-    services_block = text.split("services:", 1)[1]
-    runner_section = services_block.split("runner:", 1)[1].split("\n  ", 1)[0]
-    assert "RUNNER_TOKEN" not in runner_section, (
-        "docker-compose.yml must not put RUNNER_TOKEN in the listener environment"
-    )
-    assert "TITAN_RUNNER_TOKEN" not in runner_section, (
-        "docker-compose.yml must not put TITAN_RUNNER_TOKEN in the listener environment"
+    assert "RUNNER_TOKEN: ${TITAN_RUNNER_TOKEN:-}" in text, (
+        "docker-compose.yml must pass the startup token to the runner"
     )
 
 
@@ -565,7 +555,7 @@ def test_deploy_refuses_unsupported_host_architectures() -> None:
 def test_deploy_exposes_required_subcommands() -> None:
     """``deploy.sh`` must expose every documented subcommand."""
     text = _read(DEPLOY_SCRIPT)
-    for subcommand in ("build", "probe", "register", "up", "down", "status", "logs"):
+    for subcommand in ("build", "probe", "up", "down", "status", "logs"):
         assert subcommand in text, (
             f"deploy.sh must handle the {subcommand!r} subcommand"
         )
@@ -575,7 +565,7 @@ def test_deploy_probe_uses_entrypoint_override() -> None:
     """``deploy.sh probe`` MUST override the image entrypoint to probe."""
     text = _read(DEPLOY_SCRIPT)
     # Locate the probe branch and confirm it overrides the entrypoint.
-    branch = text.split("probe)", 1)[1].split("register)", 1)[0]
+    branch = text.split("probe)", 1)[1].split("up)", 1)[0]
     assert "--entrypoint /usr/local/bin/probe" in branch, (
         "deploy.sh probe must set --entrypoint /usr/local/bin/probe"
     )
@@ -591,7 +581,7 @@ def test_deploy_probe_does_not_use_host_network() -> None:
     to host services goes through ``host.docker.internal``.
     """
     text = _read(DEPLOY_SCRIPT)
-    branch = text.split("probe)", 1)[1].split("register)", 1)[0]
+    branch = text.split("probe)", 1)[1].split("up)", 1)[0]
     # Executable code only; comments may reference the forbidden
     # flags in negation form without using them.
     code_only = "\n".join(
@@ -605,38 +595,21 @@ def test_deploy_probe_does_not_use_host_network() -> None:
     )
 
 
-def test_deploy_register_uses_compose_run() -> None:
-    """``deploy.sh register`` MUST invoke the Compose registration
-    service through ``docker compose run --rm`` so the sidecar
-    container is removed on success."""
+def test_deploy_has_no_register_subcommand() -> None:
+    """Registration is an internal startup phase of the single runner
+    container; deploy.sh must not expose a separate lifecycle command."""
     text = _read(DEPLOY_SCRIPT)
-    branch = text.split("register)", 1)[1].split("up)", 1)[0]
-    assert "docker compose" in branch, (
-        "deploy.sh register must invoke docker compose"
-    )
-    assert "run --rm register" in branch, (
-        "deploy.sh register must invoke the register service with --rm"
-    )
-    assert "docker run" not in branch, (
-        "deploy.sh register must NOT call docker run directly"
-    )
+    assert "register)" not in text
+    assert "run --rm register" not in text
 
 
-def test_deploy_register_does_not_use_host_network() -> None:
-    """``deploy.sh register`` MUST NOT use ``--network host`` or
-    ``--ipc host``. The Compose registration service runs on
-    ordinary bridge networking."""
+def test_deploy_up_is_registration_entrypoint() -> None:
+    """``deploy.sh up`` is the sole registration-and-start command."""
     text = _read(DEPLOY_SCRIPT)
-    branch = text.split("register)", 1)[1].split("up)", 1)[0]
-    assert "--network host" not in branch, (
-        "deploy.sh register must NOT use --network host"
-    )
-    assert "--ipc host" not in branch, (
-        "deploy.sh register must NOT use --ipc host"
-    )
-    # The Compose registration service wires
-    # ``host.docker.internal`` through the ``extra_hosts`` block.
-    # The deploy.sh helper does not need to repeat it here.
+    up_branch = text.split("up)", 1)[1].split("down)", 1)[0]
+    assert "docker compose" in up_branch
+    assert "up -d" in up_branch
+    assert "--force-recreate" in up_branch
 
 
 def test_deploy_register_does_not_mount_token_file_on_long_running() -> None:
@@ -654,10 +627,8 @@ def test_deploy_register_does_not_mount_token_file_on_long_running() -> None:
         "deploy.sh up must not pass the legacy token file env var to compose"
     )
     # ``deploy.sh up`` MUST NOT pass any env-file to Compose either.
-    # The listener service declares neither ``RUNNER_TOKEN`` nor
-    # ``TITAN_RUNNER_TOKEN``; the only deployment variables it
-    # needs are interpolated from the gitignored ``.env`` that
-    # Compose reads by default.
+    # The startup token is interpolated from the gitignored ``.env``
+    # by Compose; deploy.sh does not pass it as a command argument.
     assert "--env-file" not in up_branch, (
         "deploy.sh up must NOT pass a custom --env-file to Compose; "
         "the listener must rely on Compose's default .env interpolation"
@@ -707,56 +678,25 @@ def test_deploy_token_interface_uses_allowlisted_env_file() -> None:
         assert key in text, f"deploy.sh allowlist must declare {key!r}"
 
 
-def test_deploy_register_propagates_only_token_var_name() -> None:
-    """The Compose registration service MUST receive
-    ``TITAN_RUNNER_TOKEN`` (forwarded as ``RUNNER_TOKEN``) from
-    the gitignored ``.env`` only. ``deploy.sh register`` MUST
-    NOT echo the literal token value into a log line or pass it
-    as a ``--env KEY=VALUE`` argument."""
+def test_deploy_token_is_forwarded_by_compose_environment() -> None:
+    """The startup registration phase receives the token through the
+    allowlisted Compose environment, not a shell command argument."""
     text = _read(DEPLOY_SCRIPT)
-    register_branch = text.split("register)", 1)[1].split("up)", 1)[0]
-    # The shell-side variable may be referenced for the lifecycle
-    # guard (``-z`` checks) but the literal token value must never
-    # appear on a ``--env`` / ``-e`` / ``docker run`` argument.
-    code_only = "\n".join(
-        line for line in register_branch.splitlines() if not line.lstrip().startswith("#")
-    )
-    assert "--env TITAN_RUNNER_TOKEN=" not in code_only, (
-        "deploy.sh register must NOT pass the token value as a --env KEY=VALUE argument"
-    )
-    assert "-e TITAN_RUNNER_TOKEN=" not in code_only, (
-        "deploy.sh register must NOT pass the token value as a -e KEY=VALUE argument"
-    )
-    # The blank-and-rerun helper echo MAY mention the literal
-    # ``TITAN_RUNNER_TOKEN=`` name because it is an operator-facing
-    # recipe, not a docker argument. Strip those documented echo
-    # lines before asserting that no docker argument carries the
-    # literal token name.
-    code_only_stripped = "\n".join(
-        line
-        for line in code_only.splitlines()
-        if "/^TITAN_RUNNER_TOKEN=" not in line
-        and "TITAN_RUNNER_TOKEN=\" \"${TITAN_RUNNER_ENV_FILE" not in line
-    )
-    assert "RUNNER_TOKEN=" not in code_only_stripped, (
-        "deploy.sh register must NOT embed RUNNER_TOKEN as a docker argument; "
-        "Compose forwards it from .env into the register service"
-    )
-    assert "docker run" not in code_only_stripped, (
-        "deploy.sh register must NOT call docker run directly; "
-        "it must invoke docker compose run --rm register"
-    )
+    assert "TITAN_RUNNER_TOKEN" in text
+    assert "RUNNER_TOKEN" in _read(COMPOSE_FILE)
+    assert "--env TITAN_RUNNER_TOKEN=" not in text
+    assert "-e TITAN_RUNNER_TOKEN=" not in text
 
 
 def test_deploy_takes_exclusive_lock_for_lifecycle_mutations() -> None:
-    """``deploy.sh`` register/up/down MUST take an exclusive flock."""
+    """``deploy.sh`` up/down MUST take an exclusive flock."""
     text = _read(DEPLOY_SCRIPT)
     assert "flock -n 9" in text, "deploy.sh must take an exclusive flock"
     assert "/var/lock/titan-runner.lock" in text, (
         "deploy.sh must use /var/lock/titan-runner.lock by default"
     )
-    # All three mutation subcommands must call take_lock.
-    for sub in ("register", "up", "down"):
+    # Both mutation subcommands must call take_lock.
+    for sub in ("up", "down"):
         branch = text.split(f"{sub})", 1)[1].split("logs)", 1)[0]
         assert "take_lock" in branch, (
             f"deploy.sh {sub!r} must take the lifecycle lock"
@@ -778,6 +718,7 @@ def test_deploy_status_reports_runner_health_signals() -> None:
         "ShmSize",
         "host.docker.internal",
         "RUNNER_TOKEN",
+        "registration during startup",
     ):
         assert marker in branch, f"deploy.sh status must surface {marker!r}"
 
@@ -816,10 +757,9 @@ def test_compose_volumes_have_explicit_names() -> None:
 
     Without ``name:``, Docker Compose scopes the volume by the
     project name (e.g. ``titan-stocks-runner_titan-runner-state``),
-    so a direct ``docker run -v titan-runner-state:...`` from
-    ``deploy.sh register`` writes to a *different* volume than
-    ``docker compose up`` mounts. The result is "credentials not
-    found" at the next start.
+    so the runner's Compose lifecycle always refers to the same
+    stable volume name after container recreation. The result is
+    "credentials not found" at the next start if this drifts.
     """
     text = _read(COMPOSE_FILE)
     # The volumes block at the bottom must pin every name explicitly.
@@ -836,8 +776,7 @@ def test_compose_bridge_network_has_explicit_name() -> None:
     """The bridge network MUST declare an explicit ``name:``.
 
     Without ``name:``, Docker Compose scopes the network by the
-    project name and the registration sidecar (a direct ``docker
-    run``) cannot attach to it.
+    project name and the runner would not have a stable network name.
     """
     text = _read(COMPOSE_FILE)
     networks_block = text.split("networks:", 1)[1]
@@ -859,10 +798,9 @@ def test_compose_work_bind_mount_has_identical_source_and_target() -> None:
     containers started by the host Docker daemon can publish
     artefacts into the same workspace the listener reads.
 
-    The contract is documented in ``docker-compose.yml``: the
-    registration sidecar establishes ``runner:runner`` ownership on
-    the host directory so the listener can write into it without
-    a permission failure on the very first start.
+    The startup registration phase and listener share this mount in
+    the same container, so the listener sees the exact host path used
+    by child service containers.
     """
     import yaml
 
@@ -870,55 +808,29 @@ def test_compose_work_bind_mount_has_identical_source_and_target() -> None:
         data = yaml.safe_load(fh)
     services = data.get("services")
     assert isinstance(services, dict), "services must parse as a mapping"
-    register = services.get("register")
     runner = services.get("runner")
-    assert isinstance(register, dict), "register service must parse as a mapping"
     assert isinstance(runner, dict), "runner service must parse as a mapping"
 
-    for service_name, service in (("register", register), ("runner", runner)):
-        bind_mounts = [
-            v
-            for v in service.get("volumes", [])
-            if isinstance(v, dict) and v.get("type") == "bind"
-        ]
-        work_mounts = [
-            v
-            for v in bind_mounts
-            if isinstance(v.get("target"), str)
-            and "titan-runner/work" in v["target"]
-        ]
-        assert work_mounts, (
-            f"{service_name} service must declare a bind mount whose "
-            "target resolves to /var/lib/titan-runner/work"
-        )
-        mount = work_mounts[0]
-        assert "create_host_path" not in mount, (
-            f"{service_name} service must not put create_host_path at the "
-            "top level; Docker Compose rejects that schema"
-        )
-        assert mount.get("bind", {}).get("create_host_path") is True, (
-            f"{service_name} service work bind mount must enable "
-            "create_host_path so Compose creates the host directory"
-        )
-        source = mount.get("source")
-        target = mount.get("target")
-        assert source and target, (
-            f"{service_name} service work bind mount must declare both "
-            "source and target"
-        )
-        # Compose preserves identical source/target bindings when
-        # both resolve to the same Compose variable. The contract
-        # requires the literal equality after Compose resolves the
-        # ``${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}``
-        # default; ``docker compose config`` would expand the
-        # variable and would surface a drift. We assert the
-        # textual equality here so the contract is enforced even
-        # when ``docker compose`` is unavailable in the test
-        # environment.
-        assert source == target, (
-            f"{service_name} service work bind mount source and target "
-            f"must be identical (source={source!r}, target={target!r})"
-        )
+    bind_mounts = [
+        v for v in runner.get("volumes", [])
+        if isinstance(v, dict) and v.get("type") == "bind"
+    ]
+    work_mounts = [
+        v for v in bind_mounts
+        if isinstance(v.get("target"), str)
+        and "titan-runner/work" in v["target"]
+    ]
+    assert work_mounts, "runner must declare a bind mount for the work directory"
+    mount = work_mounts[0]
+    assert "create_host_path" not in mount
+    assert mount.get("bind", {}).get("create_host_path") is True
+    source = mount.get("source")
+    target = mount.get("target")
+    assert source and target
+    assert source == target, (
+        f"runner work bind mount source and target must be identical "
+        f"(source={source!r}, target={target!r})"
+    )
 
     # The volumes block MUST NOT declare a named ``titan-runner-work``
     # volume; the contract has moved to a bind mount.
@@ -969,16 +881,13 @@ def test_compose_healthcheck_uses_lightweight_signal() -> None:
     )
 
 
-def test_compose_register_sidecar_does_not_mount_browser_volume() -> None:
-    """``deploy.sh register`` mounts state + docker socket; it
-    must NOT mount the browser volume because registration does not
-    touch Chromium."""
-    text = _read(DEPLOY_SCRIPT)
-    register_branch = text.split("register)", 1)[1].split("up)", 1)[0]
-    assert "titan-runner-browser" not in register_branch, (
-        "deploy.sh register must not bind-mount titan-runner-browser; "
-        "registration does not need Playwright"
-    )
+def test_compose_has_no_registration_sidecar() -> None:
+    """The Compose stack must contain only the steady-state runner."""
+    import yaml
+
+    with COMPOSE_FILE.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    assert set(data.get("services", {})) == {"runner"}
 
 
 def test_dockerfile_bakes_pinned_playwright_core_install() -> None:
@@ -1227,7 +1136,7 @@ def test_deploy_probe_does_not_leak_token() -> None:
     environment explicitly so the listener-derived allowlist never
     reaches the probe."""
     text = _read(DEPLOY_SCRIPT)
-    branch = text.split("probe)", 1)[1].split("register)", 1)[0]
+    branch = text.split("probe)", 1)[1].split("up)", 1)[0]
     # No token-stripping helper is required because no env-file is
     # passed at all; the sidecar's environment is built explicitly.
     assert "build_env_file" not in branch, (
@@ -2031,7 +1940,7 @@ def test_deploy_probe_passes_expected_arch_to_sidecar() -> None:
     mismatched Docker daemon before the rest of the contract runs.
     """
     text = _read(DEPLOY_SCRIPT)
-    branch = text.split("probe)", 1)[1].split("register)", 1)[0]
+    branch = text.split("probe)", 1)[1].split("up)", 1)[0]
     assert "-e EXPECTED_ARCH=" in branch, (
         "deploy.sh probe must pass -e EXPECTED_ARCH to the sidecar"
     )
@@ -2206,114 +2115,45 @@ def test_fetch_runner_maps_targetarch_and_rejects_unsupported() -> None:
     )
 
 
-def test_compose_registers_one_shot_service() -> None:
-    """The Compose contract MUST declare a one-shot ``register``
-    service that runs before the listener through
-    ``depends_on: condition: service_completed_successfully``."""
+def test_compose_has_exactly_one_runner_service() -> None:
+    """Compose must not create a disposable registration service."""
+    import yaml
+
+    with COMPOSE_FILE.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    assert set(data.get("services", {})) == {"runner"}
+    assert "depends_on" not in data["services"]["runner"]
+
+
+def test_compose_runner_receives_startup_registration_token() -> None:
+    """The sole runner service receives the short-lived token for its
+    internal registration phase."""
+    import yaml
+
+    with COMPOSE_FILE.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    environment = data["services"]["runner"]["environment"]
+    assert environment["RUNNER_TOKEN"] == "${TITAN_RUNNER_TOKEN:-}"
+
+
+def test_start_runner_runs_registration_before_listener() -> None:
+    """The single container must run idempotent registration before
+    checking state and launching the listener."""
+    text = _read(START_RUNNER_SCRIPT)
+    register_idx = text.index("/usr/local/bin/register")
+    state_idx = text.index("missing persisted credential")
+    listener_idx = text.index('"$RUNNER_RUNTIME_DIR/run.sh"')
+    assert register_idx < state_idx < listener_idx
+    assert "unset RUNNER_TOKEN" in text
+
+
+def test_compose_runner_mounts_state_and_work() -> None:
+    """The sole runner service owns both registration and listener
+    mounts, including state and the identical work bind mount."""
     text = _read(COMPOSE_FILE)
-    # Locate the services block.
-    services_block = text.split("services:", 1)[1].split("networks:", 1)[0]
-    # The ``register`` service must be declared before the
-    # ``runner`` service.
-    register_idx = services_block.find("  register:")
-    runner_idx = services_block.find("  runner:")
-    assert register_idx != -1, (
-        "docker-compose.yml must declare a `register` service"
-    )
-    assert runner_idx != -1, (
-        "docker-compose.yml must declare a `runner` service"
-    )
-    assert register_idx < runner_idx, (
-        "docker-compose.yml must declare `register` before `runner`"
-    )
-    # The runner service must depend on register with
-    # service_completed_successfully so the listener never
-    # starts until the sidecar exits zero.
-    runner_block = services_block.split("  runner:", 1)[1]
-    assert "depends_on:" in runner_block, (
-        "docker-compose.yml runner service must declare depends_on"
-    )
-    assert "service_completed_successfully" in runner_block, (
-        "docker-compose.yml runner service must depend on "
-        "service_completed_successfully"
-    )
-    assert "register:" in runner_block, (
-        "docker-compose.yml runner service must depend on the register service"
-    )
-
-
-def test_compose_register_service_receives_token_only() -> None:
-    """Only the Compose ``register`` service may declare
-    ``RUNNER_TOKEN`` (or ``TITAN_RUNNER_TOKEN``) in its
-    environment. The listener service MUST be completely free
-    of both names."""
-    text = _read(COMPOSE_FILE)
-    services_block = text.split("services:", 1)[1].split("networks:", 1)[0]
-    register_block = services_block.split("  register:", 1)[1].split("  runner:", 1)[0]
-    # The runner block runs to the end of the services section;
-    # strip comments before asserting that the executable code is
-    # free of token references.
-    runner_block = services_block.split("  runner:", 1)[1]
-    runner_code_only = "\n".join(
-        line for line in runner_block.splitlines() if not line.lstrip().startswith("#")
-    )
-    assert "RUNNER_TOKEN:" in register_block, (
-        "docker-compose.yml register service must declare RUNNER_TOKEN"
-    )
-    assert "TITAN_RUNNER_TOKEN" in register_block, (
-        "docker-compose.yml register service must source the token from "
-        "TITAN_RUNNER_TOKEN in the .env file"
-    )
-    # The listener must declare neither name in its executable
-    # configuration. Comments in the listener block may describe
-    # the negation ("MUST NOT contain") without violating the
-    # contract.
-    assert "RUNNER_TOKEN" not in runner_code_only, (
-        "docker-compose.yml runner service MUST NOT declare RUNNER_TOKEN"
-    )
-    assert "TITAN_RUNNER_TOKEN" not in runner_code_only, (
-        "docker-compose.yml runner service MUST NOT declare TITAN_RUNNER_TOKEN"
-    )
-
-
-def test_compose_register_service_overrides_entrypoint() -> None:
-    """The ``register`` service MUST override the image's default
-    entrypoint with ``/usr/local/bin/register`` so the sidecar
-    runs the registration logic instead of the long-running
-    listener."""
-    text = _read(COMPOSE_FILE)
-    services_block = text.split("services:", 1)[1].split("networks:", 1)[0]
-    register_block = services_block.split("  register:", 1)[1].split("  runner:", 1)[0]
-    assert "entrypoint:" in register_block, (
-        "docker-compose.yml register service must declare an entrypoint override"
-    )
-    assert "/usr/local/bin/register" in register_block, (
-        "docker-compose.yml register service must invoke /usr/local/bin/register"
-    )
-
-
-def test_compose_register_service_mounts_state_and_work() -> None:
-    """The ``register`` service MUST mount the persistent state
-    volume and the identical host/container work bind mount so
-    credentials are written into the same volume the listener
-    reads and so the work directory exists at the documented
-    absolute path with ``runner:runner`` ownership before the
-    listener starts."""
-    text = _read(COMPOSE_FILE)
-    services_block = text.split("services:", 1)[1].split("networks:", 1)[0]
-    register_block = services_block.split("  register:", 1)[1].split("  runner:", 1)[0]
-    assert "titan-runner-state:/var/lib/titan-runner/state" in register_block, (
-        "docker-compose.yml register service must mount titan-runner-state at "
-        "/var/lib/titan-runner/state"
-    )
-    assert "type: bind" in register_block, (
-        "docker-compose.yml register service must mount the work "
-        "directory as a bind mount"
-    )
-    assert "create_host_path: true" in register_block, (
-        "docker-compose.yml register service must allow Compose to "
-        "create the host bind-mount path"
-    )
+    assert "titan-runner-state:/var/lib/titan-runner/state" in text
+    assert "type: bind" in text
+    assert "create_host_path: true" in text
 
 
 def test_register_serializes_through_state_lock() -> None:
@@ -2412,17 +2252,9 @@ def test_register_is_transactional() -> None:
     )
 
 
-def test_compose_listener_restarts_on_successful_reregistration() -> None:
-    """The listener's ``depends_on`` declaration MUST enable
-    dependency restart behaviour so a successful re-registration
-    causes the listener to reload its persisted credentials.
-
-    The contract requires ``restart: true`` on the
-    ``depends_on.register`` block so that a successful
-    re-registration (``config.sh --replace`` exits 0) forces the
-    listener to recreate and read the freshly-published
-    credentials from ``titan-runner-state``.
-    """
+def test_compose_listener_has_no_registration_dependency() -> None:
+    """The listener and registration phases share one container; no
+    disposable service dependency is allowed."""
     import yaml
 
     with COMPOSE_FILE.open(encoding="utf-8") as fh:
@@ -2431,25 +2263,7 @@ def test_compose_listener_restarts_on_successful_reregistration() -> None:
     assert isinstance(services, dict)
     runner = services.get("runner")
     assert isinstance(runner, dict)
-    deps = runner.get("depends_on")
-    assert isinstance(deps, dict), (
-        "runner.depends_on must be a mapping so the dependency "
-        "restart behaviour can be expressed"
-    )
-    register_dep = deps.get("register")
-    assert isinstance(register_dep, dict), (
-        "runner.depends_on.register must be a mapping"
-    )
-    assert register_dep.get("condition") == "service_completed_successfully", (
-        "runner.depends_on.register.condition must remain "
-        "service_completed_successfully so a failed registration "
-        "still prevents the listener from starting"
-    )
-    assert register_dep.get("restart") is True, (
-        "runner.depends_on.register.restart must be true so a "
-        "successful re-registration reloads the listener's "
-        "persisted credentials"
-    )
+    assert "depends_on" not in runner
 
 
 def test_register_drift_triggers_reregistration_with_backup() -> None:
@@ -2556,13 +2370,13 @@ def test_register_handles_failed_local_state_publication() -> None:
 
 def test_register_token_metadata_is_removed_after_blank_and_rerun() -> None:
     """The blank-and-rerun flow MUST remove the token from the
-    stopped registration container metadata.
+    recreated runner container metadata.
 
     ``register.sh`` unsets ``RUNNER_TOKEN`` immediately after
     ``config.sh`` returns and traps the unset on every exit path,
     so a blanked ``TITAN_RUNNER_TOKEN`` in ``.env`` followed by a
-    fresh ``docker compose up -d`` recreates the registration
-    sidecar without the token. The trap MUST also unset the token
+    fresh ``docker compose up -d`` recreates the runner without the
+    token. The trap MUST also unset the token
     on every exit path including SIGINT/SIGTERM so an interrupted
     registration does not leave the token visible in the process
     list or in child output.
@@ -2597,28 +2411,19 @@ def test_register_token_metadata_is_removed_after_blank_and_rerun() -> None:
     )
 
 
-def test_compose_token_variables_absent_from_listener_configuration() -> None:
-    """The listener service MUST NOT declare ``RUNNER_TOKEN`` or
-    ``TITAN_RUNNER_TOKEN`` in its environment block. The runner
-    authenticates with the GitHub-issued long-lived secret
-    persisted by ``register``; the registration token never
-    reaches the listener.
-    """
-    text = _read(COMPOSE_FILE)
-    services_block = text.split("services:", 1)[1].split("networks:", 1)[0]
-    runner_block = services_block.split("  runner:", 1)[1]
-    runner_code_only = "\n".join(
-        line for line in runner_block.splitlines() if not line.lstrip().startswith("#")
-    )
-    # Neither name may appear in the executable configuration of
-    # the listener block. Comments may describe the negation
-    # without violating the contract.
-    assert "RUNNER_TOKEN" not in runner_code_only, (
-        "docker-compose.yml listener MUST NOT declare RUNNER_TOKEN"
-    )
-    assert "TITAN_RUNNER_TOKEN" not in runner_code_only, (
-        "docker-compose.yml listener MUST NOT declare TITAN_RUNNER_TOKEN"
-    )
+def test_compose_token_is_startup_only_and_not_persisted() -> None:
+    """The runner receives the token for startup, while the entrypoint
+    explicitly removes it before execing the listener."""
+    import yaml
+
+    with COMPOSE_FILE.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    environment = data["services"]["runner"]["environment"]
+    assert "RUNNER_TOKEN" in environment
+    text = _read(START_RUNNER_SCRIPT)
+    unset_idx = text.index("unset RUNNER_TOKEN")
+    launch_idx = text.index('"$RUNNER_RUNTIME_DIR/run.sh"')
+    assert unset_idx < launch_idx
 
 
 def test_publish_workflow_installs_pinned_test_requirements() -> None:
@@ -3066,9 +2871,10 @@ esac
 
 def test_publish_workflow_validates_compose_contract() -> None:
     """The publish workflow contract job MUST parse the Compose
-    contract and confirm the one-command startup dependencies.
-    Without this step a regression that drops ``depends_on`` or
-    moves ``register`` after ``runner`` ships unnoticed.
+    contract and confirm the single-container startup lifecycle.
+    Without this step a regression that adds a disposable service
+    or drops the identical host/container work bind mount ships
+    unnoticed.
 
     The contract validation prefers ``docker compose config`` with
     the secret-free ``.env.example`` so the resolved Compose model
@@ -3081,7 +2887,7 @@ def test_publish_workflow_validates_compose_contract() -> None:
     text = _read(PUBLISH_WORKFLOW)
     # The contract suite parses the Compose file as part of its
     # contract checks. The Python contract tests already pin the
-    # ``depends_on`` and one-command startup contract; the
+    # single-container and one-command startup contract; the
     # publish workflow MUST keep the contract job on the
     # critical path so a regression blocks publication.
     assert "docker-compose.yml" in text or "docker compose" in text, (

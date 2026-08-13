@@ -294,10 +294,9 @@ LABEL org.opencontainers.image.title="titan-stocks-runner" \
       org.opencontainers.image.source="https://github.com/PintjesB/titan-stocks-runner" \
       org.opencontainers.image.vendor="PintjesB"
 
-# ``init: true`` enables ``tini`` as PID 1 so the runner's child
-# processes receive clean signals and zombies are reaped. The
-# default argument runs the persistent listener; ``register``
-# overrides the command at deployment time to perform the
-# one-shot credential copy.
+# The image-owned ``tini`` entrypoint runs ``start-runner``. That
+# startup script performs the idempotent registration phase in this
+# same container, unsets the short-lived token, and then launches the
+# persistent listener.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start-runner"]
 CMD []

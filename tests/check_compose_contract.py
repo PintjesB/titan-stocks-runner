@@ -4,21 +4,13 @@
 #
 # The contract requires:
 #
-#   * Two services: ``register`` (one-shot) and ``runner``
-#     (long-running listener).
-#   * The ``runner`` service declares ``depends_on`` on
-#     ``register`` with the documented
-#     ``service_completed_successfully`` condition and the
-#     ``restart: true`` directive so a successful
-#     re-registration reloads the listener's persisted
-#     credentials.
+#   * Exactly one service: ``runner`` (the long-running listener).
+#   * Registration runs inside the runner's startup entrypoint; there
+#     is no disposable Compose service or ``depends_on`` gate.
 #   * The workspace mount is an identical host/container bind
 #     mount; a named ``titan-runner-work`` volume is forbidden.
 #   * Persistent ``titan-runner-state`` and ``titan-runner-browser``
-#     named volumes are declared so Compose owns their
-#     lifecycle and a direct ``docker run -v`` from the
-#     registration sidecar reaches the same volume the listener
-#     reads.
+#     named volumes are declared so Compose owns their lifecycle.
 #
 # A regression that drops any of these surfaces blocks the
 # ``publish.yml`` workflow contract job and prevents publication.
@@ -105,40 +97,22 @@ def _validate(resolved: dict | None, raw: dict) -> None:
     services = data.get("services")
     if not isinstance(services, dict):
         _fail("docker-compose.yml must declare `services:` as a mapping")
-    for required in ("register", "runner"):
-        if required not in services:
-            _fail(f"docker-compose.yml must declare a `{required}` service")
-    register = services["register"]
+    if set(services) != {"runner"}:
+        _fail(
+            "docker-compose.yml must declare exactly one service, `runner`; "
+            "registration is an internal startup phase"
+        )
     runner = services["runner"]
-    if not isinstance(register, dict):
-        _fail("docker-compose.yml `register` service must be a mapping")
     if not isinstance(runner, dict):
         _fail("docker-compose.yml `runner` service must be a mapping")
+    if "depends_on" in runner:
+        _fail("docker-compose.yml `runner` must not declare `depends_on`")
 
-    if "depends_on" not in runner:
-        _fail("docker-compose.yml `runner` service must declare `depends_on`")
-    deps = runner["depends_on"]
-    if not isinstance(deps, dict):
+    environment = runner.get("environment") or {}
+    if "RUNNER_TOKEN" not in environment:
         _fail(
-            "docker-compose.yml `runner.depends_on` must be a mapping with "
-            "the condition short form"
-        )
-    register_dep = deps.get("register")
-    if not isinstance(register_dep, dict):
-        _fail(
-            "docker-compose.yml `runner.depends_on.register` must be a mapping"
-        )
-    if register_dep.get("condition") != "service_completed_successfully":
-        _fail(
-            "docker-compose.yml `runner.depends_on.register.condition` must "
-            "be `service_completed_successfully` so the listener only "
-            "starts after the registration sidecar exits zero"
-        )
-    if not register_dep.get("restart"):
-        _fail(
-            "docker-compose.yml `runner.depends_on.register.restart` must "
-            "be true so a successful re-registration reloads the "
-            "listener's persisted credentials"
+            "docker-compose.yml runner environment must pass RUNNER_TOKEN "
+            "to the startup registration phase"
         )
 
     # The workspace MUST be a bind mount with identical absolute
@@ -149,48 +123,46 @@ def _validate(resolved: dict | None, raw: dict) -> None:
     # default to the absolute path; the YAML fallback inspects
     # the raw interpolation form so the contract is still pinned
     # when docker is unavailable.
-    for service_name, service in (("register", register), ("runner", runner)):
-        if resolved is not None:
-            bind_mounts = [
-                m
-                for m in (service.get("volumes") or [])
-                if isinstance(m, dict) and m.get("type") == "bind"
-            ]
-        else:
-            bind_mounts = [
-                v
-                for v in (service.get("volumes") or [])
-                if isinstance(v, dict) and v.get("type") == "bind"
-            ]
-        work_mounts = [
-            m for m in bind_mounts if _is_work_mount(m)
+    service_name, service = "runner", runner
+    if resolved is not None:
+        bind_mounts = [
+            m
+            for m in (service.get("volumes") or [])
+            if isinstance(m, dict) and m.get("type") == "bind"
         ]
-        if not work_mounts:
-            _fail(
-                f"docker-compose.yml `{service_name}` service must mount the "
-                "workspace as a bind mount"
-            )
-        mount = work_mounts[0]
-        if resolved is None:
-            bind = mount.get("bind")
-            if not isinstance(bind, dict) or bind.get("create_host_path") is not True:
-                _fail(
-                    f"docker-compose.yml `{service_name}` service work bind mount "
-                    "must declare bind.create_host_path: true"
-                )
-        source = mount.get("source")
-        target = mount.get("target")
-        if not source or not target:
-            _fail(
-                f"docker-compose.yml `{service_name}` service work bind mount "
-                "must declare both source and target"
-            )
-        if source != target:
+    else:
+        bind_mounts = [
+            v
+            for v in (service.get("volumes") or [])
+            if isinstance(v, dict) and v.get("type") == "bind"
+        ]
+    work_mounts = [m for m in bind_mounts if _is_work_mount(m)]
+    if not work_mounts:
+        _fail(
+            f"docker-compose.yml `{service_name}` service must mount the "
+            "workspace as a bind mount"
+        )
+    mount = work_mounts[0]
+    if resolved is None:
+        bind = mount.get("bind")
+        if not isinstance(bind, dict) or bind.get("create_host_path") is not True:
             _fail(
                 f"docker-compose.yml `{service_name}` service work bind mount "
-                "source and target must be identical "
-                f"(source={source!r}, target={target!r})"
+                "must declare bind.create_host_path: true"
             )
+    source = mount.get("source")
+    target = mount.get("target")
+    if not source or not target:
+        _fail(
+            f"docker-compose.yml `{service_name}` service work bind mount "
+            "must declare both source and target"
+        )
+    if source != target:
+        _fail(
+            f"docker-compose.yml `{service_name}` service work bind mount "
+            "source and target must be identical "
+            f"(source={source!r}, target={target!r})"
+        )
 
     # The named work volume MUST NOT be declared; the workspace is
     # a bind mount now.

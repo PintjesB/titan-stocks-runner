@@ -118,18 +118,18 @@ Buildx on `PATH`; the VM platform and host firewall are the
 
    ```bash
    docker compose pull
-   docker compose up -d
+   ./deploy.sh up
    ```
 
-   The `register` sidecar runs first and the listener only
-   starts once registration completes successfully.
+   The single runner container performs registration during startup
+   and starts the listener only once registration completes.
 
-4. Blank the token and re-run Compose so the stopped
-   registration container metadata no longer carries the token:
+4. Blank the token and recreate the runner so its metadata no longer
+   carries the token:
 
    ```bash
    sed -i '/^TITAN_RUNNER_TOKEN=/d' .env
-   docker compose up -d
+   ./deploy.sh up
    ```
 
 5. Dispatch the `runner-smoke` workflow from the
@@ -245,7 +245,7 @@ identity drift: GitHub auto-attaches the `self-hosted`,
 listener's actual platform, so the custom-label list shrinks to
 `TITAN_RUNNER_LABELS=titan-ci` only. Set a fresh
 `TITAN_RUNNER_TOKEN` in `.env` and re-run `docker compose up -d`
-so the registration sidecar re-registers against GitHub with the
+so the startup registration phase re-registers against GitHub with the
 new label list. The previous ARM64 registration is replaced in
 place through `--replace`; a stale offline entry in the GitHub
 UI under **Settings &rarr; Actions &rarr; Runners** must be
@@ -254,6 +254,5 @@ removed manually if a partial commit leaves it behind.
 The new AMD64 VM registers normally with fresh state and a
 fresh token: `docker compose pull` resolves the matching
 `linux/amd64` entry from the multi-platform digest,
-`docker compose up -d` runs the registration sidecar, and the
-listener starts. No prior ARM64 credentials are copied to the
-new VM.
+`docker compose up -d` runs registration inside the runner, and the
+listener starts. No prior ARM64 credentials are copied to the new VM.

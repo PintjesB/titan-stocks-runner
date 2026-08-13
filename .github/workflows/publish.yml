@@ -123,10 +123,9 @@ jobs:
         run: |
           set -euo pipefail
           # The Compose file is the one-command startup contract;
-          # a regression that drops the registration sidecar, the
-          # ``depends_on: service_completed_successfully`` gate,
-          # the dependency restart behaviour, or the identical
-          # host/container work bind mount MUST block the publish.
+          # a regression that adds a disposable registration service
+          # or drops the identical host/container work bind mount
+          # MUST block the publish.
           # The contract suite already pins the structural
           # assertions in Python; this step additionally confirms
           # the file is well-formed by piping it through the

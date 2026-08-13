@@ -46,8 +46,8 @@ target differ).
   to `${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` so the
   host Docker daemon's view of the workspace matches the
   listener's view. Compose creates the host path on demand; the
-  registration sidecar establishes `runner:runner` ownership
-  before the listener starts. Workflow service containers
+  startup registration establishes `runner:runner` ownership before
+  the listener starts. Workflow service containers
   started by the host Docker daemon attach the same absolute
   path to share the runner's checkout.
 * **`runtime`** &mdash; disposable. Materialised from the image on
@@ -96,10 +96,9 @@ shell-sourced.
 ## 3. Bootstrap a short-lived registration token
 
 GitHub registration tokens are valid for about an hour. The token
-is read once by the `register` Compose service, exported into the
-one-shot sidecar as `RUNNER_TOKEN`, unset before `config.sh`
-returns, and never persisted in the image, the state volume, or
-the listener environment.
+is read by the runner startup entrypoint as `RUNNER_TOKEN`, unset
+before the listener is launched, and never persisted in the image,
+the state volume, or the listener process environment.
 
 ```bash
 gh api -X POST \
@@ -110,7 +109,7 @@ gh api -X POST \
 Paste the token onto the `TITAN_RUNNER_TOKEN=` line in `.env`. A
 SOPS-decrypted file, an AWS Secrets Manager `get-secret-value`
 output, or a HashiCorp Vault read are equally valid; the value is
-forwarded by Compose to the `register` service as `RUNNER_TOKEN`
+forwarded by Compose to the runner startup phase as `RUNNER_TOKEN`
 and the shell never logs the literal value.
 
 ## 4. Pull the image
@@ -132,23 +131,23 @@ on either AMD64 or ARM64 VMs without re-tagging.
 
 ## 5. Bring up the stack
 
-`docker compose up -d` is the only command required. The
-`register` service runs first and the listener only starts after
-it exits successfully:
+`./deploy.sh up` is the only command required. The single
+runner container performs registration during startup and launches
+the listener only after it succeeds:
 
 ```bash
 docker compose pull
-docker compose up -d
+./deploy.sh up
 ```
 
-The `register` sidecar is idempotent:
+The internal `register.sh` phase is idempotent:
 
 * If the persistent `state` volume already contains matching
   `.runner`, `.credentials`, and `diagnostics.txt` (matching
-  repository URL, runner name, and label list), the sidecar exits
+  repository URL, runner name, and label list), registration exits
   successfully without contacting GitHub and without requiring
   `TITAN_RUNNER_TOKEN`.
-* If the state is missing or has drifted, the sidecar contacts
+* If the state is missing or has drifted, registration contacts
   GitHub using `RUNNER_TOKEN` (forwarded from
   `TITAN_RUNNER_TOKEN`) and persists the new credentials into
   the same volume. A transactional local backup ensures that an
@@ -158,8 +157,8 @@ The `register` sidecar is idempotent:
   after `config.sh --replace` and must be cleaned up manually
   if a partial commit leaves a stale remote entry.
 * A missing `RUNNER_TOKEN` together with a missing or drifted
-  state fails the sidecar with actionable guidance so the
-  listener cannot come up with broken credentials.
+  state fails startup with actionable guidance so the listener
+  cannot come up with broken credentials.
 
 The listener uses the image's default entrypoint
 (`tini` -> `start-runner`). The token is *never* mounted on the
@@ -189,28 +188,26 @@ Actions &rarr; Runners** with the configured name, the
 ## 7. Blank the token and re-run Compose
 
 After successful registration the token is still visible in the
-stopped registration container's metadata because Compose
-interpolates it from `.env`. Blank the `TITAN_RUNNER_TOKEN=`
-line and re-run `docker compose up -d` so the metadata no longer
-carries the token. The in-place edit MUST leave no token-bearing
-backup on disk:
+runner container's environment metadata because Compose interpolates
+it from `.env`. Blank the `TITAN_RUNNER_TOKEN=` line and recreate the
+runner with `./deploy.sh up` so the metadata no longer carries
+the token. The in-place edit MUST leave no token-bearing backup on
+disk:
 
 ```bash
 sed -i '/^TITAN_RUNNER_TOKEN=/d' .env
-docker compose up -d
+./deploy.sh up
 ```
 
-The registration sidecar runs again, sees an empty
-`RUNNER_TOKEN` and a matching persisted identity, exits
-successfully without contacting GitHub, and the listener keeps
-authenticating with the long-lived secret. The `register`
-service container is recreated without the token; the previous
-metadata no longer carries it.
+Registration runs again, sees an empty `RUNNER_TOKEN` and a matching
+persisted identity, exits successfully without contacting GitHub,
+and the listener keeps authenticating with the long-lived secret.
+The single runner container is recreated without the token.
 
 > **Note:** the old offline GitHub runner entry may need manual
 > removal from **Settings &rarr; Actions &rarr; Runners** if the
-> runner was previously registered through the old
-> `deploy.sh register --rm docker run` workflow or with a
+> runner was previously registered through an older
+> one-shot registration workflow or with a
 > different label list. The new flow registers the same runner
 > identity in place, but a prior offline entry with the same
 > name is not removed automatically.

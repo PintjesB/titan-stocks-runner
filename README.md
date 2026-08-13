@@ -13,7 +13,7 @@ Actions runner for
   specific SHA-256 digests.
 * **Lifecycle** &mdash; a small set of shell scripts that operators
   invoke on the dedicated CI VM through `deploy.sh` (`build`,
-  `probe`, `register`, `up`, `down`, `status`, `logs`).
+  `probe`, `up`, `down`, `status`, `logs`).
 * **Contract tests** &mdash; focused Python and shell tests that pin
   the documented operator contract.
 * **Publishing** &mdash; a `publish` workflow that builds the real
@@ -87,16 +87,12 @@ runner container
                                     /dev/shm isolated, sized 2gb
 ```
 
-The stack exposes two services: a one-shot `register` sidecar and a
-long-running `runner` listener. The listener declares
-`depends_on: register: condition: service_completed_successfully`
-so `docker compose up -d` always runs the registration phase
-first; a matching persisted identity exits successfully without
-contacting GitHub, while a missing or drifted identity fails the
-sidecar and prevents the listener from coming up. The
-`depends_on.register.restart: true` directive additionally
-causes the listener to reload its persisted credentials whenever a
-successful re-registration completes.
+The stack exposes exactly one service and one steady-state
+container: `runner` (`titan-runner`). Its startup entrypoint runs the
+idempotent registration phase in-process, then launches the listener.
+A matching persisted identity exits successfully without contacting
+GitHub; a missing or drifted identity requires a fresh token and
+prevents the listener from starting until registration succeeds.
 
 ## Quick start (dedicated CI VM)
 
@@ -135,17 +131,16 @@ VM-level network isolation contract is documented in
    ```
 
    Paste the resulting token onto the `TITAN_RUNNER_TOKEN=` line in
-   `.env`. The token is forwarded by Compose to the one-shot
-   `register` service as `RUNNER_TOKEN` and is unset before
-   `config.sh` returns; it never reaches the listener.
+   `.env`. The token is forwarded by Compose to the runner startup
+   entrypoint as `RUNNER_TOKEN`; it is unset before the listener is
+   launched and never reaches the listener process.
 
-3. Start the persistent listener. The `register` sidecar runs
-   first and the listener only starts once registration completes
-   successfully:
+3. Start the single runner container. Registration runs internally
+   before the listener starts:
 
    ```bash
    docker compose pull
-   docker compose up -d
+   ./deploy.sh up
    ```
 
    `register.sh` is idempotent: a matching persisted identity
@@ -164,13 +159,12 @@ VM-level network isolation contract is documented in
    ```
 
 5. Blank the `TITAN_RUNNER_TOKEN=` line in `.env` (the documented
-   blank-and-rerun flow) and re-run `docker compose up -d` so the
-   stopped registration container metadata no longer carries the
-   token:
+   blank-and-recreate flow) and re-run `./deploy.sh up` so the
+   recreated runner metadata no longer carries the token:
 
    ```bash
    sed -i '/^TITAN_RUNNER_TOKEN=/d' .env
-   docker compose up -d
+   ./deploy.sh up
    ```
 
    The in-place edit leaves no `*.bak` token-bearing backup on
@@ -215,16 +209,16 @@ VM-level network isolation contract is documented in
 | IPC | isolated `shm_size: 2gb`; the listener does **not** share the VM IPC namespace |
 | Privileges | `no-new-privileges:true`; `privileged: false`; no DinD, no socket proxy, no Docker API TCP port |
 | Docker socket | bind-mounted read/write directly from the VM; the socket's VM GID is granted as a *supplemental* group to the runner user inside the container; the daemon's reported architecture MUST match the native runner architecture (emulated/mismatched daemons are rejected by both the capability probe and the pre-job hook) |
-| Registration | one-shot `register` Compose service gated by `depends_on: register: condition: service_completed_successfully` and `restart: true` on the listener; idempotent (a matching persisted identity exits without contacting GitHub); serialised through `state/.lock/register.lock`; identity drift automatically re-registers with a fresh token and the listener reloads its persisted credentials on the next start |
+| Registration | Internal startup phase of the single `runner` service; idempotent (a matching persisted identity exits without contacting GitHub); serialised through `state/.lock/register.lock`; identity drift automatically re-registers with a fresh token before the listener starts |
 | Registration labels | `TITAN_RUNNER_LABELS=titan-ci` (custom labels only); GitHub automatically attaches `self-hosted`, `linux`, and `X64`/`ARM64` based on the listener's actual platform |
-| Registration token | `TITAN_RUNNER_TOKEN` forwarded by Compose to the `register` service as `RUNNER_TOKEN`; unset immediately after `config.sh`; never reaches the listener or the persistent state. Local rollback on ordinary `config.sh` errors is best-effort; the GitHub-side runner record is not transactionally restored after `config.sh --replace` |
-| Listener env | listener service declares neither `RUNNER_TOKEN` nor `TITAN_RUNNER_TOKEN`; the runner authenticates with the GitHub-issued long-lived secret persisted in `state/.credentials` |
+| Registration token | `TITAN_RUNNER_TOKEN` forwarded by Compose to the runner startup entrypoint as `RUNNER_TOKEN`; unset before the listener is launched and never available to the listener process or persistent state. Local rollback on ordinary `config.sh` errors is best-effort; the GitHub-side runner record is not transactionally restored after `config.sh --replace` |
+| Listener env | The startup shell consumes and unsets `RUNNER_TOKEN` before execing the listener; the runner then authenticates with the GitHub-issued long-lived secret persisted in `state/.credentials` |
 | State | `titan-runner-state` volume holds the Actions runner credentials |
 | Runtime | disposable materialised tree at `/var/lib/titan-runner/runtime/`; rebuilt on every container start |
 | Work | identical VM/container bind mount on `${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` so child service containers started by the VM Docker daemon publish artefacts into the same absolute path the listener reads; Compose creates the VM path on demand; the contract rejects named-volume workspaces and bind mounts whose source and target differ |
 | Browser | `titan-runner-browser` volume holds the Playwright cache; seeded from the baked image cache on first start |
 | Hygiene | pre-job hook validates VM capabilities and confirms the Docker daemon architecture matches the native runner architecture (`RUNNER_ARCH=X64`/`ARM64`); post-job hook tears down only `titan-stocks-playwright-` Compose projects (containers, networks, anonymous volumes); never recurses the runner's `_work` directory; never runs a global prune; hooks activated through `ACTIONS_RUNNER_HOOK_JOB_STARTED` and `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` |
-| Lifecycle lock | `flock /var/lock/titan-runner.lock` around `register`, `up`, `down`; `register.sh` additionally holds `state/.lock/register.lock` so the registration itself is serialised |
+| Lifecycle lock | `flock /var/lock/titan-runner.lock` around `up` and `down`; `register.sh` additionally holds `state/.lock/register.lock` so startup registration is serialised |
 | Image pin | every deployment references `ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest>` |
 | VM rotation | rotate the VM by preserving the `titan-runner-state` volume and the VM bind mount on the work directory; no new token is required |
 

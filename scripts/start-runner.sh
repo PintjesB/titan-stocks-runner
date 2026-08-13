@@ -4,9 +4,10 @@
 # Architecture
 # ============
 #
-# Three storage tiers cooperate at startup. Each tier is recreated or
-# refreshed independently so a container restart never has to fetch a
-# new registration token.
+# The image-owned tree, persistent state, and disposable runtime
+# cooperate at startup. Registration and listening share this one
+# container, while persisted identity means ordinary restarts do not
+# need a new registration token.
 #
 #   /opt/actions-runner         Image-owned immutable binary tree
 #                              (e.g. ``run.sh``, ``config.sh``,
@@ -49,19 +50,21 @@
 #
 # On every start the script:
 #
-#   1. Refuses to run without a non-empty ``state/.runner`` and
-#      ``state/.credentials``. The script never fetches a
-#      registration token; the operator must run
-#      ``deploy.sh register`` once.
-#   2. Grants the host Docker socket's GID to the runner user as a
+#   1. Runs the idempotent ``register`` phase in this same container.
+#      A matching persisted identity exits immediately; a fresh or
+#      changed identity requires ``RUNNER_TOKEN``. The token is unset
+#      before the listener is launched.
+#   2. Refuses to run if registration did not leave a non-empty
+#      ``state/.runner`` and ``state/.credentials``.
+#   3. Grants the host Docker socket's GID to the runner user as a
 #      *supplemental* group; the primary ``runner`` group is
 #      preserved.
-#   3. Rebuilds the runtime tree from ``/opt/actions-runner`` and
+#   4. Rebuilds the runtime tree from ``/opt/actions-runner`` and
 #      overlays the persisted registration files onto it.
-#   4. Seeds the persistent browser volume from the baked image
+#   5. Seeds the persistent browser volume from the baked image
 #      cache only on the first start; subsequent starts use the
 #      existing contents.
-#   5. Launches ``run.sh`` directly via ``gosu`` with no runtime
+#   6. Launches ``run.sh`` directly via ``gosu`` with no runtime
 #      flags. ``--disableupdate`` is set at registration and
 #      persists in the ``.runner`` manifest.
 #
@@ -81,12 +84,17 @@
 #                       ``/home/runner/.cache/ms-playwright``.
 #   RUNNER_ROOT         Image-owned source tree. Default
 #                       ``/opt/actions-runner``.
+#   RUNNER_TOKEN        Short-lived GitHub registration token. It is
+#                       consumed by ``register`` and unset before the
+#                       listener process starts.
 #
 # Exit codes
 # ==========
 #
 #   0  Listener exited cleanly.
 #   1  Required configuration missing or invalid.
+#   2  Registration token missing for a new or changed identity.
+#   3  GitHub runner configuration failed.
 #   4  Listener exited non-zero.
 set -euo pipefail
 
@@ -104,14 +112,26 @@ RUNNER_BROWSER_DIR="${RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}"
 RUNNER_BROWSER_SEED="${RUNNER_BROWSER_SEED:-/home/runner/.cache/ms-playwright}"
 RUNNER_ROOT="${RUNNER_ROOT:-/opt/actions-runner}"
 
-# Refuse to start without configured state. A fresh container without
-# credentials would otherwise loop forever attempting to fetch a
-# non-existent registration token.
+# The Compose service is the only long-lived container. Registration is
+# an internal startup phase, and these traps ensure the short-lived
+# token is never retained by the shell if registration or startup fails.
+cleanup_token() { unset RUNNER_TOKEN || true; }
+trap cleanup_token EXIT
+trap 'cleanup_token; exit 129' HUP
+trap 'cleanup_token; exit 130' INT
+trap 'cleanup_token; exit 143' TERM
+
+log "ensuring persistent GitHub runner registration"
+/usr/local/bin/register
+unset RUNNER_TOKEN
+
+# Registration must have produced complete persisted state. This is a
+# defensive check for a successful-but-incomplete registration script.
 for path in \
     "$RUNNER_STATE_DIR/.runner" \
     "$RUNNER_STATE_DIR/.credentials"; do
     if [ ! -s "$path" ]; then
-        fail "missing persisted credential file: $path. Run register first." 1
+        fail "missing persisted credential file after registration: $path" 1
     fi
 done
 

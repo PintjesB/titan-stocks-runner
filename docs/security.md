@@ -141,17 +141,17 @@ runtime. Six rules apply:
 * The token lives in a gitignored, mode-`0600` `.env` file
   consumed by the documented `deploy.sh` allowlist. The
   allowlist parser refuses shell-unsafe values.
-* `docker compose up -d` interpolates the token into the
-  one-shot `register` service as `RUNNER_TOKEN`. The literal
+* `./deploy.sh up` (which invokes Compose) interpolates the token into the single
+  runner container as `RUNNER_TOKEN` for its startup registration
+  phase. The literal
   token value never appears as a `docker run --env` argument
   or in a log line.
 * `register.sh` unsets `RUNNER_TOKEN` immediately after
   `config.sh` returns and traps the unset on every exit path.
-* The long-running listener never receives the token. The
-  listener service declares neither `RUNNER_TOKEN` nor
-  `TITAN_RUNNER_TOKEN` in its environment; the runner
-  authenticates with the GitHub-issued long-lived secret
-  persisted in `state/.credentials`.
+* The startup shell unsets `RUNNER_TOKEN` before it execs the
+  long-running listener. The listener process therefore never
+  receives the token and authenticates with the GitHub-issued
+  long-lived secret persisted in `state/.credentials`.
 * Registration is idempotent: a matching persisted identity
   exits successfully without contacting GitHub and without
   requiring a fresh token, so steady-state deployments never
@@ -160,22 +160,18 @@ runtime. Six rules apply:
   automatically detected and a fresh token triggers a
   transactional local re-registration.
 * After successful registration, blank the
-  `TITAN_RUNNER_TOKEN=` line in `.env` and re-run
-  `docker compose up -d` so the stopped registration
-  container metadata no longer carries the token. The
-  blank-and-rerun flow MUST use an in-place edit that leaves
-  no token-bearing backup file on disk; the listener's
-  `depends_on.register.restart: true` declaration then
-  reloads the persisted credentials on the next start. The
-  next `docker compose up -d` runs the registration sidecar
-  again, sees an empty `RUNNER_TOKEN` and a matching persisted
-  identity, and exits successfully without contacting GitHub.
+  `TITAN_RUNNER_TOKEN=` line in `.env` and recreate the runner
+  with `./deploy.sh up` so its metadata no longer carries
+  the token. The blank-and-rerun flow MUST use an in-place edit
+  that leaves no token-bearing backup file on disk. The next
+  startup registration sees an empty `RUNNER_TOKEN` and matching
+  persisted identity, exits successfully without contacting GitHub,
+  and then launches the listener.
 
-The persistent state volume is never mounted on the one-shot
-sidecar that consumes the token outside the documented
-allowlist. The `.credentials*` files are written by the sidecar
-into the persistent state volume and authenticated by the
-long-running listener through the registered GitHub identity.
+The persistent state volume is mounted only on the runner container.
+The internal registration phase writes `.credentials*` into that
+volume, and the subsequent listener authenticates through the
+registered GitHub identity.
 
 ## Registration label contract
 
@@ -194,7 +190,7 @@ Existing ARM64 runners must re-register once because changing
 (`self-hosted,linux,ARM64,titan-ci`) to `titan-ci` is
 intentional identity drift: the old custom-label list is being
 removed rather than augmented. Set a fresh `TITAN_RUNNER_TOKEN`
-and run `docker compose up -d` so the registration sidecar
+and run `./deploy.sh up` so the startup registration phase
 re-registers against GitHub with the new label list. The new
 AMD64 VM registers normally with fresh state and a fresh
 token.
@@ -203,16 +199,10 @@ token.
 
 Concurrent registration attempts are serialised through an
 exclusive flock on `state/.lock/register.lock` so two
-`docker compose up -d` invocations cannot race a credential
-replacement. The listener's `depends_on: register: condition:
-service_completed_successfully` gate additionally prevents the
-listener from starting until the sidecar exits zero; a failed
-registration therefore stops the listener from coming up.
-
-The listener's `depends_on.register.restart: true` declaration
-additionally causes the listener to be recreated (and reload
-its persisted credentials) whenever a successful
-re-registration completes.
+`./deploy.sh up` invocations cannot race a credential
+replacement. Registration runs in the same startup process as the
+listener, so a failed registration exits the single container before
+the listener is launched.
 
 A re-registration takes a transactional local backup: the
 existing credentials are copied into `state/.backup-<epoch>`
@@ -278,11 +268,11 @@ performs a bounded cleanup after every workflow job:
 
 ## Lifecycle lock
 
-`deploy.sh register`, `deploy.sh up`, and `deploy.sh down`
+`deploy.sh up` and `deploy.sh down`
 take an exclusive `flock` on `/var/lock/titan-runner.lock`.
 Two operators or automations cannot execute these commands
-simultaneously, so a failed re-registration cannot race with
-an active `up`/`down` sequence.
+simultaneously, so startup registration cannot race with an active
+`up`/`down` sequence.
 
 ## State directory hardening
 

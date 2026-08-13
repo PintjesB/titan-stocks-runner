@@ -4,11 +4,9 @@
 # Architecture
 # ============
 #
-# Registration is the one phase that requires a fresh registration
-# token. It runs from the one-shot ``register`` Compose service
-# declared in ``docker-compose.yml`` (or directly via
-# ``deploy.sh register``, which invokes that service with ``--rm``).
-# The service:
+# Registration is the one phase that may require a fresh registration
+# token. It runs inside the single ``titan-runner`` Compose container
+# before the persistent listener starts. The phase:
 #
 #   1. Serializes concurrent registrations through an exclusive flock
 #      inside the persistent state volume so two ``up`` invocations

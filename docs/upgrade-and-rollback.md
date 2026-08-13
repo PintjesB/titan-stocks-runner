@@ -60,15 +60,12 @@ TITAN_RUNNER_IMAGE=ghcr.io/pintjesb/titan-stocks-runner@sha256:<new-digest> \
 from the multi-platform digest so the same `TITAN_RUNNER_IMAGE`
 works on either AMD64 or ARM64 VMs.
 
-`docker compose up -d` is idempotent: the registration sidecar
-runs first, sees the matching persisted identity, exits
-successfully without contacting GitHub, and the listener is
-then recreated with `--force-recreate`. The listener's
-`depends_on.register.restart: true` declaration additionally
-causes the listener to reload its persisted credentials
-whenever a successful re-registration completes. The listener
-rebuilds its runtime tree from the new image, restoring the
-persisted credentials from `titan-runner-state`. No new
+`docker compose up -d` is idempotent: the single runner container's
+startup registration sees the matching persisted identity, exits
+successfully without contacting GitHub, and the listener is then
+recreated with `--force-recreate`. The listener rebuilds its runtime
+tree from the new image, restoring the persisted credentials from
+`titan-runner-state`. No new
 registration token is needed because the GitHub-issued secret
 in `.credentials` is image-independent and survives a container
 recreation on the same state volume.
@@ -119,7 +116,7 @@ operator needs a fresh registration token whenever:
   `titan-ci` that GitHub auto-attaches on both architectures.
 
 Set a fresh `TITAN_RUNNER_TOKEN` in `.env` and re-run
-`docker compose up -d`. The `register` sidecar detects the
+`docker compose up -d`. The startup registration phase detects the
 identity drift, takes a transactional local backup of the
 existing credentials, calls `config.sh --replace` to
 re-register, and restores the backup if the new local
@@ -130,10 +127,9 @@ must be cleaned up manually if a partial commit leaves a stale
 remote entry. After a successful re-registration, blank the
 `TITAN_RUNNER_TOKEN=` line in `.env` (using an in-place edit
 that leaves no `*.bak` token-bearing backup on disk) and re-run
-`docker compose up -d` so the token leaves the stopped
-registration container metadata; the listener's
-`depends_on.register.restart: true` declaration reloads the
-persisted credentials on the next start.
+`docker compose up -d` so the token leaves the recreated runner
+metadata; the startup entrypoint reloads the persisted credentials
+on the next start.
 
 > **Note:** if the previous registration is left as an offline
 > entry in the GitHub UI under **Settings &rarr; Actions

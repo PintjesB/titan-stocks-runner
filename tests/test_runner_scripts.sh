@@ -25,8 +25,8 @@
 #   * ``pre-job.sh`` reads ``RUNNER_ARCH`` and rejects a Docker
 #     daemon whose reported architecture does not match the
 #     native runner architecture.
-#   * ``deploy.sh`` rejects unknown subcommands and refuses to
-#     register without a token.
+#   * ``deploy.sh`` rejects unknown subcommands and exposes only the
+#     single-container lifecycle commands.
 #   * ``pre-job.sh`` and ``post-job.sh`` exist, are executable,
 #     and contain the documented contract.
 
@@ -328,19 +328,17 @@ test_deploy_rejects_unknown_subcommand() {
     ok "deploy.sh rejects unknown subcommands"
 }
 
-test_deploy_register_dispatches_to_compose_run() {
-    # The ``register`` subcommand dispatches through Compose rather than
-    # gating on ``TITAN_RUNNER_TOKEN``: ``register.sh`` itself handles
-    # the empty-token case when the persisted identity already matches.
-    # Without Docker available the script aborts through the
-    # ``ensure_compose`` guard before any state mutation; that
-    # non-zero exit is acceptable for the contract test.
-    local text
+test_deploy_uses_single_container_lifecycle() {
+    local text up_branch
     text="$(cat "$ROOT_DIR/deploy.sh")"
-    branch="$(printf '%s\n' "$text" | awk '/register\)/{flag=1;next}/up\)/{flag=0}flag')"
-    assert_contains "$branch" "docker compose" "deploy.sh register must invoke docker compose"
-    assert_contains "$branch" "run --rm register" "deploy.sh register must invoke the register service with --rm"
-    ok "deploy.sh register dispatches to docker compose run --rm register"
+    if [[ "$text" == *$'register)'* ]]; then
+        echo "FAIL deploy.sh must not expose a register subcommand" >&2
+        exit 1
+    fi
+    up_branch="$(printf '%s\n' "$text" | awk '/up\)/{flag=1;next}/down\)/{flag=0}flag')"
+    assert_contains "$up_branch" "docker compose" "deploy.sh up must invoke docker compose"
+    assert_contains "$up_branch" "up -d" "deploy.sh up must start the runner detached"
+    ok "deploy.sh uses a single-container lifecycle"
 }
 
 test_pre_job_hook_exists_and_is_executable() {
@@ -411,7 +409,7 @@ main() {
     test_probe_requires_expected_arch
     test_probe_rejects_unsupported_expected_arch
     test_deploy_rejects_unknown_subcommand
-    test_deploy_register_dispatches_to_compose_run
+    test_deploy_uses_single_container_lifecycle
     test_pre_job_hook_exists_and_is_executable
     test_pre_job_hook_rejects_missing_runner_arch
     test_pre_job_hook_rejects_unsupported_runner_arch

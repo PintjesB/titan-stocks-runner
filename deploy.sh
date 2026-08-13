@@ -23,16 +23,10 @@
 #                        linux/arm64).
 #   deploy.sh probe      Run the capability probe on the image,
 #                        scoped to the native host architecture.
-#   deploy.sh register   Register the runner against GitHub
-#                        through the Compose registration service
-#                        (idempotent; a matching persisted
-#                        identity exits successfully without
-#                        contacting GitHub).
-#   deploy.sh up         Start the persistent listener through
-#                        the registration-enabled Compose stack.
-#                        The registration sidecar runs first and
-#                        the listener only starts after it exits
-#                        successfully.
+#   deploy.sh up         Register the runner if needed and start the
+#                        persistent listener in the single Compose
+#                        container. A matching persisted identity
+#                        skips the GitHub registration call.
 #   deploy.sh down       Stop the listener (state and work persist).
 #   deploy.sh status     Show the runner's state.
 #   deploy.sh logs       Tail the runner logs.
@@ -61,27 +55,23 @@
 # ``TITAN_RUNNER_TOKEN`` is the short-lived registration token.
 # GitHub registration tokens expire after one hour; refresh the
 # token immediately before the first ``docker compose up -d``. The
-# token is forwarded by Compose to the one-shot ``register``
-# service as ``RUNNER_TOKEN``; it is unset before ``config.sh``
-# returns and never reaches the listener. After successful
-# registration blank the line in ``.env`` and re-run
-# ``docker compose up -d`` so the stopped registration container
-# metadata no longer carries the token; the listener still
-# authenticates with the persisted long-lived secret.
+# token is forwarded by Compose to the single runner container as
+# ``RUNNER_TOKEN``; the startup entrypoint consumes and unsets it
+# before launching the listener. After successful registration,
+# blank the line in ``.env`` and recreate the container so the
+# listener metadata no longer carries the token; it continues to
+# authenticate with the persisted long-lived secret.
 #
 # ``docker compose`` is the only command an operator needs. The
-# ``register`` sidecar runs first through the
-# ``service_completed_successfully`` gate; the listener's
-# ``depends_on`` declaration additionally causes the listener to
-# reload its persisted credentials whenever a successful
-# re-registration completes. The Compose contract rejects
+# single runner container performs the idempotent registration phase
+# before launching its listener. The Compose contract rejects
 # arbitrary ``.env`` entries: only the variables explicitly
-# interpolated under each service's ``environment:`` block reach
-# the running services. The allowlist in this helper is the
-# auditable source of truth for the deployment surface.
+# interpolated under the runner's ``environment:`` block reach the
+# service. The allowlist in this helper is the auditable source of
+# truth for the deployment surface.
 #
-# Subcommands take an exclusive flock (``register``, ``up``,
-# ``down``); ``status`` and ``logs`` run without it so operators
+# Subcommands take an exclusive flock (``up``, ``down``); ``status``
+# and ``logs`` run without it so operators
 # can inspect the deployment while a long command runs in another
 # shell.
 set -euo pipefail
@@ -357,49 +347,18 @@ case "$action" in
             -e RUNNER_ROOT="${TITAN_RUNNER_ROOT:-/opt/actions-runner}" \
             "$TITAN_RUNNER_IMAGE"
         ;;
-    register)
-        ensure_compose
-        take_lock
-        trap release_lock EXIT
-        require TITAN_RUNNER_IMAGE
-        require TITAN_RUNNER_REPO_URL
-        listener_id="$(listener_running || true)"
-        if [ -n "$listener_id" ]; then
-            printf 'titan-runner listener is already running as %s.\n' "$listener_id" >&2
-            printf 'Run ./deploy.sh down before re-registering.\n' >&2
-            exit 1
-        fi
-        # Invoke the Compose registration service through ``--rm``
-        # so the container is removed when the one-shot sidecar
-        # exits. ``register.sh`` reads ``RUNNER_TOKEN`` from the
-        # in-container environment (forwarded by Compose from
-        # ``TITAN_RUNNER_TOKEN`` in ``.env``) and unsets it before
-        # ``config.sh`` returns. The script is idempotent: an
-        # empty ``TITAN_RUNNER_TOKEN`` is accepted when the
-        # persisted identity already matches the requested
-        # identity.
-        docker compose -f "$COMPOSE_FILE" run --rm register
-        printf 'registration complete.\n'
-        printf 'Blank TITAN_RUNNER_TOKEN in %s and rerun `docker compose up -d`\n' "${TITAN_RUNNER_ENV_FILE:-$ROOT_DIR/.env}"
-        printf 'to remove the token from the stopped registration container metadata.\n'
-        printf 'The in-place edit must NOT leave a .bak file containing the token on disk:\n'
-        printf '  sed -i "/^TITAN_RUNNER_TOKEN=/d" %s\n' "${TITAN_RUNNER_ENV_FILE:-$ROOT_DIR/.env}"
-        ;;
     up)
         ensure_compose
         take_lock
         trap release_lock EXIT
         require TITAN_RUNNER_IMAGE
         require TITAN_RUNNER_REPO_URL
-        # Use the same registration-enabled Compose stack as
-        # ``register`` so the listener never starts without
-        # matching persisted credentials. The ``register`` service
-        # runs first and the listener is gated on
-        # ``service_completed_successfully``. The registration
-        # sidecar is idempotent: a matching persisted identity
-        # exits successfully without contacting GitHub and without
-        # requiring ``TITAN_RUNNER_TOKEN``.
-        docker compose -f "$COMPOSE_FILE" up -d --force-recreate
+        # The single runner container performs registration as its
+        # startup phase, then launches the persistent listener. The
+        # registration script is idempotent: a matching persisted
+        # identity exits successfully without contacting GitHub and
+        # without requiring ``TITAN_RUNNER_TOKEN``.
+        docker compose -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans
         ;;
     down)
         ensure_compose
@@ -423,7 +382,8 @@ case "$action" in
         else
             printf 'digest       : unresolved\n'
         fi
-        echo "=== Listener container ==="
+        echo "=== Runner container ==="
+        printf 'lifecycle        : registration during startup; persistent listener\n'
         cid="$(listener_running || true)"
         if [ -n "$cid" ]; then
             docker inspect --format '{{.State.Status}}  {{.Name}}' "$cid"
@@ -483,7 +443,7 @@ case "$action" in
             "$(env_file_present)"
         ;;
     *)
-        echo "Usage: deploy.sh {build|probe|register|up|down|status|logs}" >&2
+        echo "Usage: deploy.sh {build|probe|up|down|status|logs}" >&2
         exit 2
         ;;
 esac
