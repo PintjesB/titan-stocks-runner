@@ -1,54 +1,166 @@
 # Operations
 
-This document is the operator-facing reference for `deploy.sh` and
-the persistent runner.
+This document is the operator-facing reference for `deploy.sh`,
+`docker compose`, and the persistent runner. The runner is
+deployed on a dedicated CI VM that itself is the security
+boundary; the VM network isolation contract is documented in
+[vm-deployment.md](vm-deployment.md) and pinned at the top of
+[security.md](security.md).
+
+## Multi-platform image
+
+The published image is a single multi-platform manifest that
+contains a native `linux/amd64` and a native `linux/arm64`
+build. `deploy.sh` maps the host's `uname -m` output to the
+matching `linux/amd64` or `linux/arm64` platform so a build, a
+probe, and a `docker run --platform` invocation always resolve
+to a native architecture. The Docker daemon's reported
+architecture MUST match the native runner architecture; an
+emulated or mismatched daemon is rejected by both the
+capability probe and the pre-job hook so a degraded host cannot
+pass the host-boundary contract.
+
+The two architectures are built and probed on *native* GitHub-
+hosted runners (`ubuntu-24.04` for AMD64, `ubuntu-24.04-arm`
+for ARM64). The two exact candidate digests are merged into a
+commit-specific multi-platform manifest; the merged manifest is
+then pulled and probed on both native architectures before the
+verified digest is promoted to `:latest`. Deployments pin by
+digest and ignore the mutable tag.
+
+An application job runs once on whichever compatible `titan-ci`
+runner is available. The custom-label list shrinks to
+`TITAN_RUNNER_LABELS=titan-ci` because GitHub automatically
+attaches `self-hosted`, `linux`, and `X64` / `ARM64` based on
+the listener's actual platform; the contract surfaces this as a
+deliberate `TITAN_RUNNER_LABELS` rotation rather than as an
+operator-configurable architecture override.
 
 ## Storage tiers
 
 The runner separates immutable image contents, persistent runner
-identity, and disposable materialised runtime. Each tier is recreated
-or refreshed independently so a container restart never has to fetch
-a new registration token.
+identity, and disposable materialised runtime. Each tier is
+recreated or refreshed independently so a container restart never
+has to fetch a new registration token.
 
 | Path | Storage | Owner | Mode | Persistent? |
 | --- | --- | --- | --- | --- |
 | `/opt/actions-runner` | Image-owned source tree | `root` | image default | immutable |
 | `/var/lib/titan-runner/state` | named volume `titan-runner-state` | `runner:runner` | `0750` | **yes** |
 | `/var/lib/titan-runner/runtime` | writable dir in container | `runner:runner` | `0750` | **no** |
-| `/var/lib/titan-runner/work` | host bind mount | `runner:runner` | `0750` | **yes** |
+| `${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` | identical VM/container bind mount | `runner:runner` | `0750` | **yes** |
 | `/var/lib/titan-runner/browser` | named volume `titan-runner-browser` | `runner:runner` | `0750` | **yes** |
 | `/opt/titan-probe/node_modules` | Image-owned `playwright-core` install | `root` | image default | image layer |
-| `/run/secrets/titan-runner-registration-token` | host 0600 file | `root` | `0600` | temporary |
+| `/opt/actions-runner/.hooks` | Image-owned pre/post-job hooks | `root` | `0755` | image layer |
 
 The state directory holds `.runner`, `.credentials`,
-`.credentials_rsaparams`, and a sanitised `diagnostics.txt`. The
+`.credentials_rsaparams`, `.lock/register.lock` (an internal
+serialisation flock), and a sanitised `diagnostics.txt`. The
 runtime directory is wiped on every container recreation; the
-credentials overlay it from state on the next start.
+credentials overlay it from state on the next start. The work
+directory is an identical VM/container bind mount: the source
+and target both resolve to
+`${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` so the
+VM's Docker daemon view matches the listener's view; Compose
+creates the host path on demand and the registration sidecar
+establishes `runner:runner` ownership before the listener
+starts. The contract rejects named-volume workspaces and bind
+mounts whose source and target differ.
+
+## Networking
+
+The listener runs on an ordinary Compose bridge network
+(`titan-runner-net`) rather than sharing the VM's network
+namespace. Service containers published by workflow jobs must
+expose ports onto the Docker VM so the listener can reach them
+through `host.docker.internal`. The alias maps to the VM gateway
+IP through Docker's supported host-gateway mechanism
+(`extra_hosts: ["host.docker.internal:host-gateway"]`).
+
+VM firewall rules still block inbound access to ephemeral
+Docker-published ports; bridge networking does not replace VM
+firewalling. The `DOCKER-USER` chain restrictions apply to
+traffic leaving the VM's physical interface so Docker bridges
+and `host.docker.internal` continue to work inside the
+listener. The VM-level network isolation contract is documented
+in [vm-deployment.md](vm-deployment.md); the acceptance checks
+confirm that the VM (and a disposable Docker container inside
+it) cannot reach private network ranges, the host-management
+network, link-local services, or the cloud metadata endpoint.
+
+## IPC and shared memory
+
+The listener used to share the VM IPC namespace so Playwright
+could allocate the large shared-memory segments it expects.
+Sharing the VM IPC namespace is replaced by an isolated
+`shm_size: 2gb` allocation on the listener's own `/dev/shm`. The
+Playwright Chromium binary runs entirely inside the listener's
+IPC namespace.
 
 ## `deploy.sh` reference
 
 | Subcommand | Lock | Purpose |
 | --- | --- | --- |
-| `build`   | none | Build the `linux/arm64` image with Buildx and load it into the local daemon. |
-| `probe`   | none | Run `probe.sh` in a one-shot container with the Docker socket bind-mounted. Uses `--entrypoint /usr/local/bin/probe`. |
-| `register`| exclusive | Mount the token file read-only on a one-shot sidecar, run `register.sh`, persist credentials, then exit. Refuses if a listener is running. |
-| `up`      | exclusive | Start the persistent listener through the Compose contract. Refuses unless `state/.credentials` exists. The token file is **not** mounted. |
-| `down`    | exclusive | Stop the listener. State, runtime, work, and browser volumes remain on disk. |
-| `status`  | none | Report runner image digest, container state, listener process, docker socket reachability, state volume contents, and token file presence. |
+| `build`   | none | Build the runner image for the native host architecture (`linux/amd64` or `linux/arm64`) with Buildx and load it into the local daemon. |
+| `probe`   | none | Run `probe.sh` in a one-shot container with the Docker socket bind-mounted. Uses `--entrypoint /usr/local/bin/probe`. Runs on ordinary bridge networking with the native platform. Passes `EXPECTED_ARCH` so the probe can reject an emulated/mismatched Docker daemon before the rest of the contract runs. The probe sidecar never receives the registration token. |
+| `register`| exclusive | Invoke the Compose registration service with `--rm`. The short-lived token is forwarded by Compose as `RUNNER_TOKEN`, unset before `config.sh` returns, and never persisted. Refuses if a listener is running. Idempotent: a matching persisted identity exits without contacting GitHub. Identity drift is automatically detected and a fresh token triggers a transactional local re-registration; the previous credentials are kept under `state/.backup-<epoch>` until the new ones are validated. Local rollback is best-effort; the GitHub-side runner record is not transactionally restored after `config.sh --replace`. |
+| `up`      | exclusive | `docker compose up -d --force-recreate`. The registration sidecar runs first; the listener only starts once `register` exits successfully. The listener's `depends_on.register.restart: true` declaration additionally causes the listener to reload its persisted credentials whenever a successful re-registration completes. The token may be absent after the first registration; the sidecar still exits successfully because the persisted identity already matches. |
+| `down`    | exclusive | `docker compose down --remove-orphans`. State, work, and browser volumes remain on disk. |
+| `status`  | none | Report runner image digest, host architecture and platform, container state, listener process, docker socket reachability, state volume contents, bridge network mode, `shm_size`, `host.docker.internal` alias resolution, and absence of both `RUNNER_TOKEN` and `TITAN_RUNNER_TOKEN` from the listener environment. |
 | `logs`    | none | Tail the runner logs (`docker compose logs`). |
 
-Architecture check: `deploy.sh` aborts immediately unless
-`uname -m` reports `aarch64` or `arm64`.
+Architecture check: `deploy.sh` maps `uname -m` to `amd64` or
+`arm64` and aborts immediately on any other host architecture.
 
-Lifecycle lock: `register`, `up`, and `down` take an exclusive flock
-on `${TITAN_RUNNER_LOCK_FILE:-/var/lock/titan-runner.lock}`. `status`
-and `logs` skip the lock so operators can inspect the deployment
-while a long command runs in another shell.
+Lifecycle lock: `register`, `up`, and `down` take an exclusive
+flock on `${TITAN_RUNNER_LOCK_FILE:-/var/lock/titan-runner.lock}`.
+`status` and `logs` skip the lock so operators can inspect the
+deployment while a long command runs in another shell. The
+registration script itself additionally takes an exclusive flock
+on `state/.lock/register.lock` so two `up` invocations cannot
+race a credential replacement.
+
+## Allowlisted env file
+
+`deploy.sh` reads every deployment variable from the configured
+`TITAN_RUNNER_ENV_FILE` (default: `.env`). The parser accepts
+only documented `KEY=value` entries; arbitrary keys are silently
+dropped. Values are checked against a shell-safety predicate (no
+newlines, no command substitution, no quoting characters) so a
+`docker run --env-file` injection is impossible. `docker compose`
+itself only interpolates the entries explicitly referenced by
+the `docker-compose.yml` contract under each service's
+`environment:` block; the allowlist is the auditable source of
+truth for which `.env` entries are deployment-relevant.
+
+The current allowlist:
+
+| Key | Purpose |
+| --- | --- |
+| `TITAN_RUNNER_IMAGE` | Pinned image digest (multi-platform manifest) |
+| `TITAN_RUNNER_REPO_URL` | Consumer repository URL |
+| `TITAN_RUNNER_NAME` | Display name |
+| `TITAN_RUNNER_LABELS` | Custom capability label list (`titan-ci`; GitHub auto-attaches `self-hosted`, `linux`, and `X64` / `ARM64`) |
+| `TITAN_RUNNER_TOKEN` | Registration token (only the `register` service sees it; never the listener) |
+| `TITAN_RUNNER_STATE_DIR` | Persistent state path |
+| `TITAN_RUNNER_RUNTIME_DIR` | Disposable runtime path |
+| `TITAN_RUNNER_WORK_DIR` | Named work volume path |
+| `TITAN_RUNNER_BROWSER_DIR` | Playwright cache path |
+| `TITAN_RUNNER_ROOT` | Image-owned runner tree path |
+| `TITAN_RUNNER_STATE_VOLUME` | Named volume for state |
+| `TITAN_RUNNER_LOCK_FILE` | Lifecycle lock path |
+
+`deploy.sh` loads the allowlisted `.env` BEFORE resolving
+`TITAN_RUNNER_LOCK_FILE` so the operator can override the
+lock-file location through the documented allowlist.
+Explicitly exported values, including deliberate empty overrides
+(`export TITAN_RUNNER_TOKEN=`), always win over `.env`.
 
 ## Persistent state layout
 
-The `register` sidecar writes five files into `$RUNNER_STATE_DIR`
-(default `/var/lib/titan-runner/state`) with strict permissions:
+The `register` sidecar writes the following files into
+`$RUNNER_STATE_DIR` (default `/var/lib/titan-runner/state`) with
+strict permissions:
 
 | File | Permission | Owner |
 | --- | --- | --- |
@@ -56,11 +168,14 @@ The `register` sidecar writes five files into `$RUNNER_STATE_DIR`
 | `.credentials` | `0600` | `runner:runner` |
 | `.credentials_rsaparams` | `0600` | `runner:runner` |
 | `.runner_pkey` | `0600` | `runner:runner` (when generated) |
+| `.lock/register.lock` | `0640` | `runner:runner` |
 | `diagnostics.txt` | `0640` | `runner:runner` |
 
 `diagnostics.txt` contains only the registered repository URL,
-runner name, label list, paths, and the runner version. It never
-contains the credentials or the registration token.
+runner name, label list, paths, and the runner version. It is
+also the source of truth for the registration idempotency check,
+so the script can detect drift without contacting GitHub when no
+token is supplied.
 
 ## Health check
 
@@ -73,35 +188,102 @@ properties and nothing else:
 * `gosu runner docker info` exits 0 &mdash; the runner user can
   reach the host Docker daemon.
 
-The full capability probe (Compose, Buildx, Node, Python, Playwright
-Chromium, ShellCheck, GitHub API) deliberately does **not** run as
-the container healthcheck. Transient dependency drift must not
-trigger a restart loop on a long-lived listener; release validation
-is the right place for the full probe.
+The full capability probe (Compose, Buildx, Node, Python,
+Playwright Chromium, ShellCheck, GitHub API,
+`host.docker.internal` alias, native-architecture match)
+deliberately does **not** run as the container healthcheck.
+Transient dependency drift must not trigger a restart loop on a
+long-lived listener; release validation is the right place for
+the full probe.
+
+## Pre-job and post-job hooks
+
+GitHub Actions invokes `$RUNNER_ROOT/.hooks/PreJob.sh` and
+`$RUNNER_ROOT/.hooks/PostJob.sh` around every job. The image
+bundles these hooks in `/opt/actions-runner/.hooks/` so they
+materialise into every runtime tree. The Compose contract wires
+the activation mechanism &mdash; the documented
+`ACTIONS_RUNNER_HOOK_JOB_STARTED` and
+`ACTIONS_RUNNER_HOOK_JOB_COMPLETED` environment variables
+pointing at absolute runtime paths &mdash; so the hooks actually
+fire.
+
+`PreJob.sh` resolves the native runner architecture from the
+`RUNNER_ARCH` env var that GitHub supplies on every job (`X64`
+on x86_64 runners, `ARM64` on aarch64 runners) and validates
+that required host capabilities and the `host.docker.internal`
+alias are available before the job starts. The Docker daemon's
+reported architecture MUST match the native runner
+architecture; an emulated or mismatched daemon aborts the hook
+before the rest of the contract runs. A failure exits non-zero
+so the runner reports the job as failed rather than letting it
+run on a degraded VM.
+
+`PostJob.sh` tears down only Compose projects whose name matches
+the documented Titan CI prefix `titan-stocks-playwright-`
+(matched through the `com.docker.compose.project` label). For
+each matching project, `docker compose down -v` removes the
+project's containers, its bridge network, and its anonymous
+volumes. Named volumes (`titan-runner-state`,
+`titan-runner-browser`, any application development volume) are
+excluded by construction. The hook never recurses the runner's
+`_work` directory, never invokes `docker system prune`,
+`docker volume prune`, `docker image prune`, `docker builder
+prune`, or `docker network prune`, and never touches the runner
+container (`titan-runner`) or any non-CI Titan workload.
 
 ## Image digest resolution
 
-`deploy.sh status` resolves the registry-served manifest digest of
-the configured `TITAN_RUNNER_IMAGE` by parsing the `Digest:` line
-emitted by `docker buildx imagetools inspect`, and validates that it
-matches `^sha256:[0-9a-f]{64}$`. The publish workflow resolves the
-digest *after* `docker push` so the value surfaced to operators is
-definitively what GHCR serves.
+`deploy.sh status` resolves the registry-served manifest digest
+of the configured `TITAN_RUNNER_IMAGE` by parsing the `Digest:`
+line emitted by `docker buildx imagetools inspect`, and validates
+that it matches `^sha256:[0-9a-f]{64}$`. The publish workflow
+resolves the digest *after* promotion so the value surfaced to
+operators is definitively what GHCR serves.
 
 ## Updating labels
 
-The capability label list is configured per host, not per image.
-Edit `TITAN_RUNNER_LABELS`, run `deploy.sh down`, run
-`deploy.sh register` (with a fresh token), then run `deploy.sh up`.
-The registration uses `--replace`, so the existing GitHub
-registration is removed before the new one is created.
+The custom-label list is configured per host, not per image.
+GitHub auto-attaches the `self-hosted`, `linux`, and `X64` /
+`ARM64` labels based on the listener's actual platform; the
+custom-label list shrinks to `TITAN_RUNNER_LABELS=titan-ci`
+only. Adding a future architecture migration is a GitHub-side
+change rather than a `TITAN_RUNNER_LABELS` rotation; existing
+runners must re-register once with a fresh `TITAN_RUNNER_TOKEN`
+because shrinking the custom-label list is intentional identity
+drift.
+
+When the operator wants to add additional custom labels (for
+example, `titan-ci,foo` for an experiment), edit
+`TITAN_RUNNER_LABELS` in `.env`, set a fresh
+`TITAN_RUNNER_TOKEN`, then run `docker compose up -d`. The
+registration sidecar detects the drift between the persisted and
+the requested identity, takes a transactional local backup of
+the existing credentials, and re-registers against GitHub. An
+ordinary `config.sh --replace` commit error restores the
+previously working local credentials so the listener cannot
+come up with broken state. The local rollback is best-effort;
+the GitHub-side runner record is not transactionally restored
+after `config.sh --replace` and must be cleaned up manually if
+a partial commit leaves a stale remote entry.
 
 ## Rotating the repository URL
 
-To migrate the runner to a new repository, run `register` with the
-new `TITAN_RUNNER_REPO_URL`. The GitHub-issued secret in
-`.credentials` is invalidated by GitHub whenever the registration
-moves between repositories, so a fresh token is required.
+To migrate the runner to a new repository, update
+`TITAN_RUNNER_REPO_URL` in `.env`, set a fresh
+`TITAN_RUNNER_TOKEN`, then run `docker compose up -d`. The
+GitHub-issued secret in `.credentials` is invalidated by GitHub
+whenever the registration moves between repositories, so a fresh
+token is required. The listener's
+`depends_on.register.restart: true` declaration reloads the
+persisted credentials once the re-registration completes.
+
+> **Note:** if the previous registration is left as an offline
+> entry in the GitHub UI under **Settings &rarr; Actions &rarr;
+> Runners**, remove it manually. The new registration re-uses
+> the same runner name and labels and cannot unregister the old
+> entry through `--replace` if the two registrations have been
+> tied to different accounts.
 
 ## Detecting listener health
 
@@ -110,13 +292,41 @@ moves between repositories, so a fresh token is required.
 * `Runner.Listener` process running inside the container.
 * Docker socket reachability: `docker info` inside the container.
 * Credentials file presence inside the container's state directory.
+* Bridge network mode: `.HostConfig.NetworkMode` is not `host`.
+* Shared memory size: `.HostConfig.ShmSize` is the documented value.
+* `host.docker.internal` alias resolution: `getent hosts`
+  resolves inside the listener.
+* `RUNNER_TOKEN` absence: the listener environment has zero
+  occurrences of `RUNNER_TOKEN=`.
+* `TITAN_RUNNER_TOKEN` absence: the listener environment has
+  zero occurrences of `TITAN_RUNNER_TOKEN=`.
 
-A red healthcheck, a missing listener process, or an inaccessible
-socket indicates the listener cannot service jobs.
+A red healthcheck, a missing listener process, an inaccessible
+socket, or an unexpected network mode indicates the listener
+cannot service jobs.
 
 ## Replacing the host
 
-See [quick-start.md &sect; 8](quick-start.md#8-tear-down-host-rotation).
-The `state` volume and the host `work`/`browser` paths are the only
-pieces that must be preserved; the runtime tree and the running
-container are disposable.
+The `state` named volume and the work host bind mount are the
+only pieces that must be preserved across a host rotation; the
+runtime tree, the `browser` volume, and the running container
+are disposable.
+
+```bash
+# Old host: stop the stack. The named volume and bind mount remain on disk.
+docker compose down
+
+# New host: transfer the titan-runner-state volume and the work
+# host bind mount (e.g. via rsync, btrfs send, or a Docker volume
+# backup plugin), then bring the stack up without re-registering.
+docker compose pull
+docker compose up -d
+```
+
+A token is only necessary when the `state` volume is empty or
+the persisted identity has drifted.
+
+After a suspected compromise, revoke the runner and discard the
+VM, credentials, volumes, and workspace; never copy them into
+the replacement. The new VM registers normally with fresh state
+and a fresh token.

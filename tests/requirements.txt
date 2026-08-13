@@ -1,0 +1,15 @@
+# Pinned runner contract-suite test dependencies.
+#
+# The contract suite runs from CI on a hosted runner (the
+# ``publish`` workflow's contract job runs on ``ubuntu-24.04``
+# because the suite only inspects project files rather than
+# exercising the image). The versions are pinned so a supply-
+# chain drift on the test runner cannot silently change the
+# contract gate's behaviour.
+#
+#   pytest     Drives the Python contract suite in
+#              ``tests/test_runner_contract.py``.
+#   PyYAML     Loads ``.github/workflows/publish.yml`` so the
+#              contract tests can assert on the workflow structure.
+pytest==9.1.1
+PyYAML==6.0.3

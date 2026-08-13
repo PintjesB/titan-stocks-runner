@@ -1,115 +1,67 @@
-# Compose contract for the persistent Titan Stocks self-hosted runner.
-#
-# Runtime architecture
-# ====================
-#
-# The container exposes a single long-running service. It is launched
-# with the image's default entrypoint (tini -> start-runner) and
-# shares four storage locations:
-#
-#   /var/lib/titan-runner/state    Named Docker volume named
-#                                  ``titan-runner-state``. Holds the
-#                                  Actions runner ``.runner`` and
-#                                  ``.credentials*`` files written by
-#                                  the registration phase and
-#                                  consumed by the listener on every
-#                                  start. Populated by
-#                                  ``deploy.sh register`` once.
-#
-#   /var/lib/titan-runner/work     Host bind mount. Used as GitHub's
-#                                  ``_work`` directory. The host must
-#                                  pre-create the directory and
-#                                  ``chown 1001:1001`` it so service
-#                                  containers started by the host
-#                                  Docker daemon can write into the
-#                                  same workspace the runner sees.
-#
-#   /var/lib/titan-runner/browser  Named Docker volume named
-#                                  ``titan-runner-browser``. Holds the
-#                                  Playwright Chromium browser cache.
-#                                  Seeded from the baked image cache
-#                                  on first start.
-#
-#   /var/run/docker.sock           Host bind mount. The runner is a
-#                                  Docker *client*; the host is the
-#                                  Docker *daemon*.
-#
-# The registration token file is never mounted on the long-running
-# listener container. ``deploy.sh register`` mounts it read-only on a
-# one-shot sidecar, consumes the token, and exits.
-#
-# Volume name pinning
-# ===================
-#
-# Both named volumes declare an explicit ``name:`` so their full
-# Docker volume names do **not** get the Compose project prefix. The
-# registration sidecar (a direct ``docker run``) and the listener
-# (``docker compose up``) must mount the exact same volume or
-# credentials written by ``register`` are lost. Docker documents that
-# ``name:`` is used as-is and not scoped by the Compose stack name.
-#
-# Operational rules
-# =================
-#
-#   * One runner container per Docker host. Adding a sibling container
-#     collides on host-network ports and corrupts concurrent jobs.
-#   * ``network_mode: host`` so Postgres service containers and
-#     Compose-published localhost ports are reachable from the
-#     workflow.
-#   * ``ipc: host`` so the Playwright suite shares the host IPC
-#     namespace.
-#   * ``no-new-privileges:true`` blocks setuid escalation. The
-#     runner never needs ``privileged: true``; privileged mode and
-#     DinD are explicitly forbidden.
-#   * The image is the sole PID 1 owner: the image's ENTRYPOINT runs
-#     ``/usr/bin/tini -- /usr/local/bin/start-runner``. Compose
-#     therefore does NOT set ``init: true``; doing so would stack
-#     two init layers (Docker-injected + image-owned).
-#   * The Docker HEALTHCHECK verifies only the listener process and
-#     the runner user's Docker socket access. The full capability
-#     probe belongs in release validation, not in the container
-#     healthcheck; transient dependency drift must not restart the
-#     listener.
-#   * The image is always pinned by immutable digest. Mutable tags
-#     are staging-only.
 services:
-  runner:
+  register:
     image: ${TITAN_RUNNER_IMAGE:?TITAN_RUNNER_IMAGE must be pinned by digest}
-    container_name: titan-runner
-    restart: unless-stopped
-    network_mode: host
-    ipc: host
+    container_name: titan-runner-register
+    restart: "no"
+    entrypoint: ["/usr/local/bin/register"]
     security_opt:
       - no-new-privileges:true
-    # Privileged mode and DinD would weaken the host boundary. Neither
-    # is necessary because the runner talks to the host daemon through
-    # the bind-mounted socket.
-    privileged: false
-    userns_mode: ""
-    read_only: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       REPO_URL: ${TITAN_RUNNER_REPO_URL:?TITAN_RUNNER_REPO_URL is required}
       RUNNER_NAME: ${TITAN_RUNNER_NAME:-titan-ci}
-      RUNNER_LABELS: ${TITAN_RUNNER_LABELS:-self-hosted,linux,ARM64,titan-ci}
+      RUNNER_LABELS: ${TITAN_RUNNER_LABELS:-titan-ci}
       RUNNER_STATE_DIR: ${TITAN_RUNNER_STATE_DIR:-/var/lib/titan-runner/state}
       RUNNER_RUNTIME_DIR: ${TITAN_RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}
       RUNNER_WORK_DIR: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
       RUNNER_BROWSER_DIR: ${TITAN_RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}
       RUNNER_ROOT: ${TITAN_RUNNER_ROOT:-/opt/actions-runner}
-      TARGETARCH: ${TARGETARCH:-arm64}
+      # Only the one-shot registration service receives the token.
+      RUNNER_TOKEN: ${TITAN_RUNNER_TOKEN:-}
     volumes:
-      # The Docker socket is the only host-side mount the runner needs.
-      # Operators MUST verify the socket's group ID is granted to the
-      # runner user inside the container.
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Persistent state. Holds the Actions runner credentials.
       - titan-runner-state:/var/lib/titan-runner/state
-      # Persistent host-visible workspace. The host path MUST match
-      # the container path so child service containers started by the
-      # host Docker daemon see the same checkout.
-      - /var/lib/titan-runner/work:/var/lib/titan-runner/work
-      # Persistent Playwright browser cache. Seeded from the baked
-      # image cache by ``start-runner`` on first start.
+      # Source and target must remain identical for host-Docker workspaces.
+      - type: bind
+        source: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
+        target: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
+        bind:
+          create_host_path: true
+
+  runner:
+    image: ${TITAN_RUNNER_IMAGE:?TITAN_RUNNER_IMAGE must be pinned by digest}
+    container_name: titan-runner
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    depends_on:
+      register:
+        condition: service_completed_successfully
+        restart: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: "2gb"
+    environment:
+      REPO_URL: ${TITAN_RUNNER_REPO_URL:?TITAN_RUNNER_REPO_URL is required}
+      RUNNER_NAME: ${TITAN_RUNNER_NAME:-titan-ci}
+      RUNNER_LABELS: ${TITAN_RUNNER_LABELS:-titan-ci}
+      RUNNER_STATE_DIR: ${TITAN_RUNNER_STATE_DIR:-/var/lib/titan-runner/state}
+      RUNNER_RUNTIME_DIR: ${TITAN_RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}
+      RUNNER_WORK_DIR: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
+      RUNNER_BROWSER_DIR: ${TITAN_RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}
+      RUNNER_ROOT: ${TITAN_RUNNER_ROOT:-/opt/actions-runner}
+      ACTIONS_RUNNER_HOOK_JOB_STARTED: ${ACTIONS_RUNNER_HOOK_JOB_STARTED:-/var/lib/titan-runner/runtime/.hooks/PreJob.sh}
+      ACTIONS_RUNNER_HOOK_JOB_COMPLETED: ${ACTIONS_RUNNER_HOOK_JOB_COMPLETED:-/var/lib/titan-runner/runtime/.hooks/PostJob.sh}
+    volumes:
+      # The Docker socket grants substantial host access.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - titan-runner-state:/var/lib/titan-runner/state
+      - type: bind
+        source: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
+        target: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
+        bind:
+          create_host_path: true
       - titan-runner-browser:/var/lib/titan-runner/browser
     healthcheck:
       test:
@@ -122,6 +74,13 @@ services:
       retries: 3
       start_period: 30s
     stop_grace_period: 30s
+    networks:
+      - titan-runner-net
+
+networks:
+  titan-runner-net:
+    name: titan-runner-net
+    driver: bridge
 
 volumes:
   titan-runner-state:
