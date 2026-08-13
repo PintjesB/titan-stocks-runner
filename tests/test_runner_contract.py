@@ -1585,6 +1585,13 @@ def test_publish_workflow_merges_native_manifests() -> None:
         "publish.yml merge step MUST consume the arm64 candidate as "
         "an immutable repository@sha256:... reference"
     )
+    assert "docker buildx imagetools inspect --raw" in merge_block, (
+        "publish.yml merge validation MUST inspect candidates through the "
+        "authenticated Docker registry client"
+    )
+    assert "curl --silent --show-error --fail" not in merge_block, (
+        "publish.yml merge validation MUST NOT use unauthenticated registry curl"
+    )
 
 
 def test_publish_workflow_asserts_merged_platforms() -> None:

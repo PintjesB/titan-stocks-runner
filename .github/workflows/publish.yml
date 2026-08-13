@@ -348,13 +348,13 @@ jobs:
           check_plain_manifest() {
               local digest="$1" arch="$2"
               local mt
-              mt="$(curl --silent --show-error --fail \
-                  -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-                  -H "Accept: application/vnd.oci.image.manifest.v1+json" \
-                  -H "Accept: application/vnd.oci.image.index.v1+json" \
-                  --head --output /dev/null \
-                  --write-out '%{content_type}\n' \
-                  "https://${REGISTRY}/v2/${REPO}/manifests/${digest}")"
+              # Docker is already authenticated to GHCR in this job.
+              # Inspect through Buildx so private-registry credentials
+              # are reused; a raw unauthenticated curl receives 401
+              # and incorrectly reports a valid candidate as invalid.
+              mt="$(docker buildx imagetools inspect --raw \
+                  "${REGISTRY}/${REPO}@${digest}" \
+                  | python3 -c 'import json, sys; print(json.load(sys.stdin).get("mediaType", ""))')"
               case "$mt" in
                   application/vnd.docker.distribution.manifest.v2+json|application/vnd.oci.image.manifest.v1+json)
                       echo "  $arch candidate manifest media type: $mt"
