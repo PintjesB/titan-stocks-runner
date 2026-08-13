@@ -467,7 +467,8 @@ jobs:
 
           out = subprocess.check_output(
               [
-                  "docker", "buildx", "imagetools", "inspect", "--raw",
+                  "docker", "buildx", "imagetools", "inspect",
+                  "--format", "{{json .Manifest}}",
                   f"{image}@{merged}",
               ],
               text=True,

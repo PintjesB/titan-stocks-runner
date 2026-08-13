@@ -1601,6 +1601,10 @@ def test_publish_workflow_merges_native_manifests() -> None:
         "publish.yml merge validation MUST normalize image@digest references "
         "before comparing registry manifest digests"
     )
+    assert '"--format", "{{json .Manifest}}"' in merge_block, (
+        "publish.yml merge validation MUST use Buildx's formatted manifest "
+        "output instead of the exit-255-prone raw mode"
+    )
     assert "path: ${{ runner.temp }}/inputs/amd64" in merge_block, (
         "publish.yml MUST download the amd64 digest into its own directory"
     )
