@@ -93,7 +93,7 @@ def test_dockerfile_installs_documented_capabilities() -> None:
         "libasound2t64",
         "libcairo2",
         "libpangocairo-1.0-0",
-        "/opt/titan-probe/node_modules/.bin/playwright install chromium",
+        "/opt/titan-probe/node_modules/.bin/playwright-core install chromium",
         "gosu",
         "tini",
     ):
@@ -481,8 +481,13 @@ def test_dockerfile_bakes_pinned_playwright_core_install() -> None:
     assert "npm ci" in text, (
         "Dockerfile must run `npm ci` against the committed lockfile"
     )
-    assert "/opt/titan-probe/node_modules/.bin/playwright install chromium" in text, (
-        "Dockerfile must use the deterministic playwright binary to install Chromium"
+    assert "/opt/titan-probe/node_modules/.bin/playwright-core install chromium" in text, (
+        "Dockerfile must invoke the playwright-core CLI (not the "
+        "non-existent `playwright` binary) to install Chromium"
+    )
+    assert "/opt/titan-probe/node_modules/.bin/playwright install chromium" not in text, (
+        "Dockerfile must NOT call `.bin/playwright`; the installed "
+        "package only exposes `playwright-core` as a CLI"
     )
 
 

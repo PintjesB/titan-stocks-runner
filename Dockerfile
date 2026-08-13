@@ -211,7 +211,7 @@ RUN cd /opt/titan-probe && npm ci --omit=dev --no-audit --no-fund \
 USER runner
 WORKDIR /home/runner
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
-RUN /opt/titan-probe/node_modules/.bin/playwright install chromium \
+RUN /opt/titan-probe/node_modules/.bin/playwright-core install chromium \
  && ls -1 /home/runner/.cache/ms-playwright
 
 USER root
