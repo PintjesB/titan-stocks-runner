@@ -299,17 +299,17 @@ jobs:
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
         with:
           name: candidate-digest-amd64
-          path: ${{ runner.temp }}/inputs
+          path: ${{ runner.temp }}/inputs/amd64
       - name: Download candidate digest (arm64)
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
         with:
           name: candidate-digest-arm64
-          path: ${{ runner.temp }}/inputs
+          path: ${{ runner.temp }}/inputs/arm64
       - name: Validate candidate digests before merging
         id: validate
         env:
-          AMD64_DIGEST_FILE: ${{ runner.temp }}/inputs/candidate-digest-amd64.txt
-          ARM64_DIGEST_FILE: ${{ runner.temp }}/inputs/candidate-digest-arm64.txt
+          AMD64_DIGEST_FILE: ${{ runner.temp }}/inputs/amd64/candidate-digest.txt
+          ARM64_DIGEST_FILE: ${{ runner.temp }}/inputs/arm64/candidate-digest.txt
           REGISTRY: ghcr.io
           REPO: pintjesb/titan-stocks-runner
         run: |

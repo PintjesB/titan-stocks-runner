@@ -1597,6 +1597,14 @@ def test_publish_workflow_merges_native_manifests() -> None:
         "publish.yml merge validation MUST retry transient GHCR visibility "
         "before failing a just-pushed candidate"
     )
+    assert "path: ${{ runner.temp }}/inputs/amd64" in merge_block, (
+        "publish.yml MUST download the amd64 digest into its own directory"
+    )
+    assert "path: ${{ runner.temp }}/inputs/arm64" in merge_block, (
+        "publish.yml MUST download the arm64 digest into its own directory"
+    )
+    assert "AMD64_DIGEST_FILE: ${{ runner.temp }}/inputs/amd64/candidate-digest.txt" in merge_block
+    assert "ARM64_DIGEST_FILE: ${{ runner.temp }}/inputs/arm64/candidate-digest.txt" in merge_block
     assert "curl --silent --show-error --fail" not in merge_block, (
         "publish.yml merge validation MUST NOT use unauthenticated registry curl"
     )
