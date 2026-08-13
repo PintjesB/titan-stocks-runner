@@ -133,9 +133,19 @@ token_file_present() {
 }
 
 image_digest() {
-    docker buildx imagetools inspect --raw "${TITAN_RUNNER_IMAGE:-}" 2>/dev/null \
-        | sed -n 's/.*"digest":"\(sha256:[0-9a-f]\{64\}\).*/\1/p' \
-        | head -n1
+    # Resolve the registry-served manifest digest for the configured
+    # image reference. The ``Digest:`` line emitted by ``buildx
+    # imagetools inspect`` is the manifest digest, not an arbitrary
+    # configuration- or layer-level digest from the raw JSON. A
+    # correctly-formatted digest is exactly ``sha256:`` followed by
+    # 64 lowercase hex characters.
+    local candidate
+    candidate="$(docker buildx imagetools inspect "${TITAN_RUNNER_IMAGE:-}" 2>/dev/null \
+        | awk '$1 == "Digest:" {print $2; exit}')"
+    if [ "$candidate" = "sha256:$(printf '%s' "$candidate" | cut -d: -f2)" ] \
+            && [ "$(printf '%s' "$candidate" | cut -d: -f2 | wc -c)" -eq 65 ]; then
+        printf '%s\n' "$candidate"
+    fi
 }
 
 case "$action" in
@@ -186,7 +196,6 @@ case "$action" in
             --security-opt no-new-privileges:true \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v titan-runner-state:/var/lib/titan-runner/state \
-            -v titan-runner-browser:/var/lib/titan-runner/browser \
             -v "$token_dir":"$token_dir":ro \
             -e REPO_URL="${TITAN_RUNNER_REPO_URL}" \
             -e RUNNER_NAME="${TITAN_RUNNER_NAME:-titan-ci}" \

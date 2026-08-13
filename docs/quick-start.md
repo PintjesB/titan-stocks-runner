@@ -7,26 +7,30 @@ available on the `PATH`.
 
 ## 1. Prepare host paths
 
-The runner distinguishes three storage tiers; pre-create the host
-paths once:
+The runner uses four storage tiers. Only one is a host bind mount and
+must be pre-created by the operator; the other three are either
+Docker-named volumes (created on first `up`) or purely disposable
+container state.
 
 ```bash
-sudo install -d -m 0750 -o 1001 -g 1001 \
-    /var/lib/titan-runner/state \
-    /var/lib/titan-runner/runtime \
-    /var/lib/titan-runner/work \
-    /var/lib/titan-runner/browser
+sudo install -d -m 0750 -o 1001 -g 1001 /var/lib/titan-runner/work
 ```
 
-* **`state`** — persistent. Holds the GitHub-issued Actions runner
-  credentials and a sanitised diagnostics summary.
+* **`state`** — persistent Docker-named volume. Holds the
+  GitHub-issued Actions runner credentials and a sanitised
+  diagnostics summary. Compose creates the
+  `titan-runner-state` volume on first `up`.
+* **`browser`** — persistent Docker-named volume. Holds the
+  Playwright Chromium browser cache. Compose creates the
+  `titan-runner-browser` volume on first `up`; `start-runner.sh`
+  seeds it from the baked image cache on the first start.
 * **`runtime`** — disposable. Materialised from the image on every
-  container start; recreated by `start-runner.sh`.
+  container start by `start-runner.sh`. Lives only inside the
+  listener container's writable layer.
 * **`work`** — host bind mount. Used as GitHub's `_work` directory.
   The same absolute path **must** exist inside the container so the
   host Docker daemon can publish child service-container artefacts
   into the runner's checkout.
-* **`browser`** — persistent. Holds the Playwright Chromium cache.
 
 ## 2. Bootstrap a short-lived registration token
 
@@ -141,23 +145,20 @@ In the GitHub UI the runner appears under **Settings &rarr; Actions
 
 ## 8. Tear down (host rotation)
 
-When a host is rotated, **only the `state` volume and the host
-work/browser paths must be preserved** — the runtime tree and the
-running container are disposable.
+When a host is rotated, **only the `state` named volume and the
+host `work` path must be preserved** — the runtime tree, the
+`browser` volume, and the running container are disposable.
 
 ```bash
 # Old host: stop the container. State and work paths remain on disk.
 ./deploy.sh down
 
-# New host: pre-create the directories, transfer /var/lib/titan-runner/state
-# and /var/lib/titan-runner/{work,browser} (e.g. via rsync, btrfs send,
-# or a backup volume), then start without re-registering.
-sudo install -d -m 0750 -o 1001 -g 1001 \
-    /var/lib/titan-runner/state \
-    /var/lib/titan-runner/runtime \
-    /var/lib/titan-runner/work \
-    /var/lib/titan-runner/browser
-# ... (restore state + work + browser) ...
+# New host: pre-create the work directory, transfer
+# /var/lib/titan-runner/work and the titan-runner-state volume (e.g.
+# via rsync, btrfs send, or a Docker volume backup plugin), then
+# start without re-registering.
+sudo install -d -m 0750 -o 1001 -g 1001 /var/lib/titan-runner/work
+# ... (restore state + work directories/volume) ...
 TITAN_RUNNER_IMAGE=ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest> \
 TITAN_RUNNER_REPO_URL=https://github.com/PintjesB/titan-stocks \
     ./deploy.sh up

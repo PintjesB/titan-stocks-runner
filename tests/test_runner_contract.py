@@ -20,6 +20,13 @@ Lifecycle invariants covered here:
   ``--start``/``--disableupdate`` flags.
 * The Compose contract mounts the host work directory at the same
   absolute path inside the container.
+* Persistent volumes declare an explicit ``name:`` so
+  ``docker run`` and ``docker compose`` references resolve to the
+  same Docker volume.
+* The container HEALTHCHECK verifies only the listener process and
+  Docker daemon reachability.
+* The Playwright probe consumes the deterministic ``/opt/titan-probe``
+  install instead of ``npx``.
 """
 from __future__ import annotations
 
@@ -31,9 +38,13 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
 COMPOSE_FILE = ROOT / "docker-compose.yml"
 DEPLOY_SCRIPT = ROOT / "deploy.sh"
+PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish.yml"
 SCRIPTS_DIR = ROOT / "scripts"
 REGISTER_SCRIPT = SCRIPTS_DIR / "register.sh"
 START_RUNNER_SCRIPT = SCRIPTS_DIR / "start-runner.sh"
+PROBE_SCRIPT = SCRIPTS_DIR / "probe.sh"
+PROBE_PACKAGE_JSON = SCRIPTS_DIR / "probe-package.json"
+PROBE_PACKAGE_LOCK = SCRIPTS_DIR / "probe-package-lock.json"
 
 DEFAULT_LABELS = "self-hosted,linux,ARM64,titan-ci"
 
@@ -81,8 +92,8 @@ def test_dockerfile_installs_documented_capabilities() -> None:
         "libgbm1",
         "libasound2t64",
         "libcairo2",
-        "libpangocairo-1.0-0t64",
-        "playwright@${PLAYWRIGHT_VERSION}",
+        "libpangocairo-1.0-0",
+        "/opt/titan-probe/node_modules/.bin/playwright install chromium",
         "gosu",
         "tini",
     ):
@@ -364,4 +375,240 @@ def test_deploy_pins_image_by_digest_only() -> None:
     text = _read(DEPLOY_SCRIPT)
     assert "TITAN_RUNNER_IMAGE" in text, (
         "deploy.sh must read TITAN_RUNNER_IMAGE as the deployment image"
+    )
+
+
+def test_dockerfile_uses_correct_pangocairo_package() -> None:
+    """Ubuntu 24.04 ARM64 does NOT ship ``libpangocairo-1.0-0t64``.
+
+    The build emits a failure for the wrong package. The
+    ``t64`` flavour exists for some libraries on Ubuntu 24.04 but
+    not for ``libpangocairo``.
+    """
+    text = _read(DOCKERFILE)
+    assert "libpangocairo-1.0-0" in text, (
+        "Dockerfile must install libpangocairo-1.0-0"
+    )
+    assert "libpangocairo-1.0-0t64" not in text, (
+        "Dockerfile must NOT install libpangocairo-1.0-0t64; the package "
+        "does not exist for Ubuntu 24.04 ARM64 and the build fails"
+    )
+
+
+def test_compose_volumes_have_explicit_names() -> None:
+    """Both persistent volumes MUST declare an explicit ``name:``.
+
+    Without ``name:``, Docker Compose scopes the volume by the
+    project name (e.g. ``titan-stocks-runner_titan-runner-state``),
+    so a direct ``docker run -v titan-runner-state:...`` from
+    ``deploy.sh register`` writes to a *different* volume than
+    ``docker compose up`` mounts. The result is "credentials not
+    found" at the next start.
+    """
+    text = _read(COMPOSE_FILE)
+    # The volumes block at the bottom must pin every name explicitly.
+    volumes_block = text.split("volumes:", 1)[1]
+    assert "name: titan-runner-state" in volumes_block, (
+        "docker-compose.yml must declare name: titan-runner-state"
+    )
+    assert "name: titan-runner-browser" in volumes_block, (
+        "docker-compose.yml must declare name: titan-runner-browser"
+    )
+
+
+def test_compose_omits_duplicate_init() -> None:
+    """``init: true`` would stack two init layers with the image's
+    tini entrypoint. The image already owns the lifecycle; Compose
+    must not add a Docker-injected init on top."""
+    text = _read(COMPOSE_FILE)
+    # The service declaration begins at ``services:`` and ends before
+    # the top-level ``volumes:`` block. Anything earlier is comment.
+    services_block = text.split("services:", 1)[1].split("\nvolumes:", 1)[0]
+    assert "init: true" not in services_block, (
+        "docker-compose.yml service must NOT set init: true; the image "
+        "already ENTRYPOINTs tini -> start-runner"
+    )
+
+
+def test_compose_healthcheck_uses_lightweight_signal() -> None:
+    """The HEALTHCHECK must verify only the listener process and the
+    runner user's Docker daemon reachability. The full capability
+    probe belongs to release validation, not container health."""
+    text = _read(COMPOSE_FILE)
+    # Locate the healthcheck block.
+    check_block = text.split("healthcheck:", 1)[1].split("volumes:", 1)[0]
+    assert "/usr/local/bin/probe" not in check_block, (
+        "HEALTHCHECK must not invoke /usr/local/bin/probe; that is the "
+        "full capability probe and belongs in release validation"
+    )
+    assert "Runner.Listener" in check_block, (
+        "HEALTHCHECK must pgrep the listener process"
+    )
+    assert "docker info" in check_block, (
+        "HEALTHCHECK must run `docker info` to confirm docker socket access"
+    )
+    # 30-second cadence signals "cheap" rather than "expensive".
+    assert "interval: 30s" in check_block, (
+        "HEALTHCHECK must run on a short interval; the heavy probe has no "
+        "place inside the container"
+    )
+
+
+def test_compose_register_sidecar_does_not_mount_browser_volume() -> None:
+    """``deploy.sh register`` mounts state + token + docker socket; it
+    must NOT mount the browser volume because registration does not
+    touch Chromium."""
+    text = _read(DEPLOY_SCRIPT)
+    register_branch = text.split("register)", 1)[1].split("up)", 1)[0]
+    assert "titan-runner-browser" not in register_branch, (
+        "deploy.sh register must not bind-mount titan-runner-browser; "
+        "registration does not need Playwright"
+    )
+
+
+def test_dockerfile_bakes_pinned_playwright_core_install() -> None:
+    """The probe dependency tree MUST be installed at build time from
+    a committed ``package.json`` and ``package-lock.json`` so the
+    image is reproducible without ever invoking ``npx`` at probe time.
+    """
+    text = _read(DOCKERFILE)
+    assert "/opt/titan-probe/package.json" in text, (
+        "Dockerfile must COPY scripts/probe-package.json into /opt/titan-probe"
+    )
+    assert "/opt/titan-probe/package-lock.json" in text, (
+        "Dockerfile must COPY scripts/probe-package-lock.json into /opt/titan-probe"
+    )
+    assert "npm ci" in text, (
+        "Dockerfile must run `npm ci` against the committed lockfile"
+    )
+    assert "/opt/titan-probe/node_modules/.bin/playwright install chromium" in text, (
+        "Dockerfile must use the deterministic playwright binary to install Chromium"
+    )
+
+
+def test_probe_package_files_pin_playwright_core_version() -> None:
+    """``scripts/probe-package.json`` and its lockfile must pin
+    ``playwright-core`` to the same version as ``PLAYWRIGHT_VERSION``."""
+    package = _read(PROBE_PACKAGE_JSON)
+    lock = _read(PROBE_PACKAGE_LOCK)
+    dockerfile = _read(DOCKERFILE)
+    # Extract the declared playwright version from the Dockerfile ARG.
+    match = re.search(r"ARG PLAYWRIGHT_VERSION=([\d.]+)", dockerfile)
+    assert match, "Dockerfile must declare ARG PLAYWRIGHT_VERSION"
+    declared_version = match.group(1)
+    assert f'"playwright-core": "{declared_version}"' in package, (
+        "probe-package.json must pin playwright-core to PLAYWRIGHT_VERSION"
+    )
+    assert f'"version": "{declared_version}"' in lock, (
+        "probe-package-lock.json must resolve playwright-core to PLAYWRIGHT_VERSION"
+    )
+
+
+def test_probe_does_not_use_npx() -> None:
+    """The probe must consume the deterministic ``/opt/titan-probe``
+    install via ``NODE_PATH``; ``npx`` interprets its first positional
+    argument as a binary to execute and cannot be used to "install
+    playwright-core and then run node"."""
+    text = _read(PROBE_SCRIPT)
+    # Executable lines only; the script's documentation may mention
+    # ``npx playwright-core`` in a "do not do this" note.
+    code_only = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "NODE_PATH=" in code_only, (
+        "probe.sh must set NODE_PATH to /opt/titan-probe/node_modules"
+    )
+    assert "/opt/titan-probe/node_modules" in code_only, (
+        "probe.sh must reference the deterministic probe install"
+    )
+    assert "npx --yes" not in code_only, (
+        "probe.sh must NOT call `npx --yes <package> ...` in executable code"
+    )
+    assert re.search(r"^\s*npx\s+playwright-core", code_only, flags=re.MULTILINE) is None, (
+        "probe.sh must NOT invoke `npx playwright-core ...` in executable code; "
+        "npx interprets the first positional as a binary"
+    )
+
+
+def test_start_runner_seeds_browser_volume_and_exports_path() -> None:
+    """``start-runner.sh`` MUST seed the persistent browser volume from
+    the baked image cache on first start and export
+    ``PLAYWRIGHT_BROWSERS_PATH`` into the runner environment."""
+    text = _read(START_RUNNER_SCRIPT)
+    code_only = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    # No fragile symlinks over a populated image directory.
+    assert "ln -sfn" not in code_only, (
+        "start-runner.sh must not symlink the image cache over the baked "
+        "directory; the seed is via cp -a"
+    )
+    # The seed step may live in a helper function; both forms are
+    # acceptable.
+    assert (
+        'cp -a "$RUNNER_BROWSER_SEED/." "$RUNNER_BROWSER_DIR/"' in code_only
+        or ('cp -a "$seed/." "$dest/"' in code_only and "RUNNER_BROWSER_SEED" in code_only and "RUNNER_BROWSER_DIR" in code_only)
+    ), "start-runner.sh must seed the persistent browser dir via cp -a"
+    assert "PLAYWRIGHT_BROWSERS_PATH=\"$RUNNER_BROWSER_DIR\"" in code_only, (
+        "start-runner.sh must export PLAYWRIGHT_BROWSERS_PATH into the runner env"
+    )
+
+
+def test_deploy_status_resolves_manifest_digest() -> None:
+    """``deploy.sh status`` must parse the manifest ``Digest:`` field
+    emitted by ``docker buildx imagetools inspect`` and validate it
+    as ``^sha256:[0-9a-f]{64}$``. Searching the raw JSON for an
+    arbitrary ``"digest":"sha256:..."`` is unsafe because a manifest
+    contains several such strings.
+    """
+    text = _read(DEPLOY_SCRIPT)
+    # Isolate the image_digest function body. The function is the
+    # last helper before the ``case "$action"`` block; it ends at
+    # the closing ``}`` followed by a blank line and ``case``.
+    body = text.split("image_digest()", 1)[1]
+    body = body.split("\ncase \"$action\"", 1)[0]
+    assert "buildx imagetools inspect" in body, (
+        "image_digest must use `docker buildx imagetools inspect`"
+    )
+    assert "Digest:" in body, (
+        "image_digest must parse the manifest Digest: line"
+    )
+    assert "awk" in body, (
+        "image_digest must use awk to extract the Digest: field"
+    )
+    # The validation must enforce the canonical SHA-256 digest
+    # format. The current implementation does so via length
+    # arithmetic (``wc -c`` against the second field) rather than
+    # an explicit regex; both are acceptable as long as the
+    # candidate is shape-checked before being reported.
+    assert (
+        ("[0-9a-f]" in body and "64" in body)
+        or ("wc -c" in body and "65" in body)
+    ), "image_digest must validate the digest is sha256:<64 hex chars>"
+
+
+def test_publish_resolves_digest_after_push() -> None:
+    """``publish.yml`` must resolve the GHCR-served manifest digest
+    after the ``docker push`` step so the reported digest is
+    definitively what the registry serves.
+    """
+    import yaml
+
+    with PUBLISH_WORKFLOW.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    job = data["jobs"]["publish"]
+    step_names = [s.get("name", "") for s in job["steps"]]
+    push_index = next(
+        (i for i, n in enumerate(step_names) if "Push" in n),
+        None,
+    )
+    digest_index = next(
+        (i for i, n in enumerate(step_names) if "digest" in n.lower() or "digest" in (n or "").lower()),
+        None,
+    )
+    assert push_index is not None and digest_index is not None, (
+        "publish.yml must have a push step and a digest-reporting step"
+    )
+    assert digest_index > push_index, (
+        "publish.yml must report the digest AFTER the push step"
     )

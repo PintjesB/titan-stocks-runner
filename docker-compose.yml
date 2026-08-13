@@ -5,9 +5,10 @@
 #
 # The container exposes a single long-running service. It is launched
 # with the image's default entrypoint (tini -> start-runner) and
-# shares three persistent storage locations with the host:
+# shares four storage locations:
 #
-#   /var/lib/titan-runner/state    Named Docker volume. Holds the
+#   /var/lib/titan-runner/state    Named Docker volume named
+#                                  ``titan-runner-state``. Holds the
 #                                  Actions runner ``.runner`` and
 #                                  ``.credentials*`` files written by
 #                                  the registration phase and
@@ -23,8 +24,11 @@
 #                                  Docker daemon can write into the
 #                                  same workspace the runner sees.
 #
-#   /var/lib/titan-runner/browser  Named Docker volume. Holds the
+#   /var/lib/titan-runner/browser  Named Docker volume named
+#                                  ``titan-runner-browser``. Holds the
 #                                  Playwright Chromium browser cache.
+#                                  Seeded from the baked image cache
+#                                  on first start.
 #
 #   /var/run/docker.sock           Host bind mount. The runner is a
 #                                  Docker *client*; the host is the
@@ -33,6 +37,16 @@
 # The registration token file is never mounted on the long-running
 # listener container. ``deploy.sh register`` mounts it read-only on a
 # one-shot sidecar, consumes the token, and exits.
+#
+# Volume name pinning
+# ===================
+#
+# Both named volumes declare an explicit ``name:`` so their full
+# Docker volume names do **not** get the Compose project prefix. The
+# registration sidecar (a direct ``docker run``) and the listener
+# (``docker compose up``) must mount the exact same volume or
+# credentials written by ``register`` are lost. Docker documents that
+# ``name:`` is used as-is and not scoped by the Compose stack name.
 #
 # Operational rules
 # =================
@@ -44,18 +58,24 @@
 #     workflow.
 #   * ``ipc: host`` so the Playwright suite shares the host IPC
 #     namespace.
-#   * ``init: true`` so ``tini`` is PID 1 and child processes get
-#     proper signal handling and zombie reaping.
 #   * ``no-new-privileges:true`` blocks setuid escalation. The
 #     runner never needs ``privileged: true``; privileged mode and
 #     DinD are explicitly forbidden.
+#   * The image is the sole PID 1 owner: the image's ENTRYPOINT runs
+#     ``/usr/bin/tini -- /usr/local/bin/start-runner``. Compose
+#     therefore does NOT set ``init: true``; doing so would stack
+#     two init layers (Docker-injected + image-owned).
+#   * The Docker HEALTHCHECK verifies only the listener process and
+#     the runner user's Docker socket access. The full capability
+#     probe belongs in release validation, not in the container
+#     healthcheck; transient dependency drift must not restart the
+#     listener.
 #   * The image is always pinned by immutable digest. Mutable tags
 #     are staging-only.
 services:
   runner:
     image: ${TITAN_RUNNER_IMAGE:?TITAN_RUNNER_IMAGE must be pinned by digest}
     container_name: titan-runner
-    init: true
     restart: unless-stopped
     network_mode: host
     ipc: host
@@ -88,18 +108,23 @@ services:
       # the container path so child service containers started by the
       # host Docker daemon see the same checkout.
       - /var/lib/titan-runner/work:/var/lib/titan-runner/work
-      # Persistent Playwright browser cache.
+      # Persistent Playwright browser cache. Seeded from the baked
+      # image cache by ``start-runner`` on first start.
       - titan-runner-browser:/var/lib/titan-runner/browser
     healthcheck:
       test:
         - CMD-SHELL
-        - /usr/local/bin/probe --skip-network || exit 1
-      interval: 5m
-      timeout: 30s
+        - >-
+          pgrep -u runner -f 'Runner.Listener' >/dev/null
+          && gosu runner docker info >/dev/null 2>&1
+      interval: 30s
+      timeout: 10s
       retries: 3
-      start_period: 2m
+      start_period: 30s
     stop_grace_period: 30s
 
 volumes:
   titan-runner-state:
+    name: titan-runner-state
   titan-runner-browser:
+    name: titan-runner-browser

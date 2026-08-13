@@ -4,13 +4,13 @@
 # This script exercises the documented capability contract without
 # registering against GitHub. Operators invoke it directly through
 # ``deploy.sh probe`` to confirm a fresh image resolves every tool the
-# workflows expect, or through the equivalent workflow to gate a
-# runner-version change.
+# workflows expect, or through the publish workflow to gate an image
+# release on capability verification.
 #
 # Probes (in order):
 #
 #   1. Required binaries: docker, docker compose, buildx, shellcheck,
-#      gh, git, bash, node, npm, npx, python3, psql.
+#      gh, git, bash, node, npm, python3, psql.
 #   2. Docker daemon reachability through the bind-mounted socket.
 #      The daemon's reported architecture must match ``linux/arm64``.
 #   3. Compose v2 plugin resolution (parses ``docker compose version``).
@@ -18,7 +18,8 @@
 #   5. Node.js 24 major version and npm presence.
 #   6. Python 3.12+ interpreter.
 #   7. Playwright Chromium binary reachable at the documented
-#      ``PLAYWRIGHT_BROWSERS_PATH`` and able to launch a headless page.
+#      ``PLAYWRIGHT_BROWSERS_PATH`` and able to launch a headless page
+#      through the deterministic ``/opt/titan-probe`` install.
 #   8. Network reachability to the GitHub API (unless ``--skip-network``).
 #
 # The probe never persists registration tokens and never touches the
@@ -26,6 +27,7 @@
 set -euo pipefail
 
 PROBE_DIR="${PROBE_DIR:-${HOME:-/tmp}/.cache/probe}"
+PROBE_NODE_MODULES="${PROBE_NODE_MODULES:-/opt/titan-probe/node_modules}"
 mkdir -p "$PROBE_DIR"
 
 ok()   { printf '  ok   %s\n' "$*"; }
@@ -82,7 +84,6 @@ probe_gh() {
 probe_node() {
     require_binary node
     require_binary npm
-    require_binary npx
     local major
     major="$(node -e 'console.log(process.versions.node.split(".")[0])')"
     [ "$major" -eq 24 ] || fail "node major version must be 24 (got $major)"
@@ -114,13 +115,19 @@ probe_postgres_client() {
 }
 
 probe_playwright() {
-    require_binary npx
     local cache="${PLAYWRIGHT_BROWSERS_PATH:-/home/runner/.cache/ms-playwright}"
     [ -d "$cache" ] || fail "playwright cache missing: $cache"
     local chromium_dir
     chromium_dir="$(find "$cache" -maxdepth 1 -type d -name 'chromium-*' | head -n1 || true)"
     [ -n "$chromium_dir" ] || fail "playwright chromium binary missing under $cache"
     ok "playwright chromium: ${chromium_dir##*/}"
+    # The probe uses the deterministic ``/opt/titan-probe`` install
+    # instead of ``npx playwright-core``. ``npx`` interprets its
+    # first positional argument as a binary to execute rather than a
+    # package to install, so the previous ``npx playwright-core node``
+    # invocation was a no-op for the intended purpose.
+    [ -d "$PROBE_NODE_MODULES/playwright-core" ] \
+        || fail "playwright-core dependency missing from $PROBE_NODE_MODULES"
     local script="$PROBE_DIR/probe.js"
     cat > "$script" <<'JS'
 const { chromium } = require('playwright-core');
@@ -140,8 +147,8 @@ const { chromium } = require('playwright-core');
   process.exit(3);
 });
 JS
+    NODE_PATH="$PROBE_NODE_MODULES" \
     PLAYWRIGHT_BROWSERS_PATH="$cache" \
-        npx --yes "playwright-core@${PLAYWRIGHT_VERSION:-1.61.1}" \
         node "$script" >&2 \
         || fail "playwright chromium launch failed"
     ok "playwright chromium launched headless and rendered smoke page"
@@ -171,3 +178,4 @@ if [ "${1:-}" != "--skip-network" ]; then
     probe_network
 fi
 echo "all capabilities verified"
+

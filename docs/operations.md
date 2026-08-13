@@ -13,10 +13,11 @@ a new registration token.
 | Path | Storage | Owner | Mode | Persistent? |
 | --- | --- | --- | --- | --- |
 | `/opt/actions-runner` | Image-owned source tree | `root` | image default | immutable |
-| `/var/lib/titan-runner/state` | named volume | `runner:runner` | `0750` | **yes** |
+| `/var/lib/titan-runner/state` | named volume `titan-runner-state` | `runner:runner` | `0750` | **yes** |
 | `/var/lib/titan-runner/runtime` | writable dir in container | `runner:runner` | `0750` | **no** |
 | `/var/lib/titan-runner/work` | host bind mount | `runner:runner` | `0750` | **yes** |
-| `/var/lib/titan-runner/browser` | named volume | `runner:runner` | `0750` | **yes** |
+| `/var/lib/titan-runner/browser` | named volume `titan-runner-browser` | `runner:runner` | `0750` | **yes** |
+| `/opt/titan-probe/node_modules` | Image-owned `playwright-core` install | `root` | image default | image layer |
 | `/run/secrets/titan-runner-registration-token` | host 0600 file | `root` | `0600` | temporary |
 
 The state directory holds `.runner`, `.credentials`,
@@ -63,13 +64,29 @@ contains the credentials or the registration token.
 
 ## Health check
 
-The Compose contract wires `probe --skip-network` into the
-`HEALTHCHECK` directive. The probe exercises the documented
-capability checks (Docker daemon reachability, Compose v2 plugin,
-Buildx, Node 24, Python 3.12, Playwright Chromium) but skips the
-GitHub API check; transient GitHub outages must not trigger a
-restart loop. A failing healthcheck means the runner cannot service
-any job and the host should investigate.
+The Compose contract wires a **lightweight** listener healthcheck
+into the `HEALTHCHECK` directive. It verifies two observable
+properties and nothing else:
+
+* `pgrep -u runner -f 'Runner.Listener'` is non-empty &mdash; the
+  listener process is alive.
+* `gosu runner docker info` exits 0 &mdash; the runner user can
+  reach the host Docker daemon.
+
+The full capability probe (Compose, Buildx, Node, Python, Playwright
+Chromium, ShellCheck, GitHub API) deliberately does **not** run as
+the container healthcheck. Transient dependency drift must not
+trigger a restart loop on a long-lived listener; release validation
+is the right place for the full probe.
+
+## Image digest resolution
+
+`deploy.sh status` resolves the registry-served manifest digest of
+the configured `TITAN_RUNNER_IMAGE` by parsing the `Digest:` line
+emitted by `docker buildx imagetools inspect`, and validates that it
+matches `^sha256:[0-9a-f]{64}$`. The publish workflow resolves the
+digest *after* `docker push` so the value surfaced to operators is
+definitively what GHCR serves.
 
 ## Updating labels
 

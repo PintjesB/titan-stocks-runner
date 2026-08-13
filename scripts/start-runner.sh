@@ -12,39 +12,58 @@
 #                              (e.g. ``run.sh``, ``config.sh``,
 #                              ``runsvc.sh``).
 #
-#   /var/lib/titan-runner/state    Persistent volume. Holds the
-#                              Actions runner ``.runner`` and
+#   /var/lib/titan-runner/state    Persistent named volume. Holds
+#                              the Actions runner ``.runner`` and
 #                              ``.credentials*`` files.
 #
 #   /var/lib/titan-runner/runtime  Materialised tree built fresh on
 #                              every container start by copying the
-#                              immutable image tree and overlaying the
-#                              persistent state. The listener reads
-#                              its configuration from here and writes
-#                              its logs here. A container recreation
-#                              can discard the runtime completely
-#                              without losing the GitHub identity.
+#                              immutable image tree and overlaying
+#                              the persistent state. The listener
+#                              reads its configuration from here and
+#                              writes its logs here. A container
+#                              recreation can discard the runtime
+#                              completely without losing the GitHub
+#                              identity.
 #
 #   /var/lib/titan-runner/work     Host bind mount used as GitHub's
 #                              ``_work`` directory. The same absolute
-#                              path exists on the Docker host so child
-#                              service containers can publish their
-#                              artefacts on the host filesystem.
+#                              path exists on the Docker host so
+#                              child service containers can publish
+#                              their artefacts on the host
+#                              filesystem.
 #
-#   /var/lib/titan-runner/browser  Persistent Playwright browser cache.
+#   /var/lib/titan-runner/browser  Persistent named volume. Holds
+#                              the Playwright Chromium browser cache.
+#                              Seeded from the baked image cache
+#                              ``/home/runner/.cache/ms-playwright``
+#                              on the first start; subsequent starts
+#                              reuse whatever the volume already
+#                              contains.
+#
+#   /opt/titan-probe/node_modules  Image-owned ``playwright-core``
+#                              dependency tree. The capability probe
+#                              resolves ``NODE_PATH`` onto this
+#                              directory instead of running
+#                              ``npx playwright-core`` at probe time.
 #
 # On every start the script:
 #
 #   1. Refuses to run without a non-empty ``state/.runner`` and
-#      ``state/.credentials``. The script never fetches a registration
-#      token; the operator must run ``deploy.sh register`` once.
+#      ``state/.credentials``. The script never fetches a
+#      registration token; the operator must run
+#      ``deploy.sh register`` once.
 #   2. Grants the host Docker socket's GID to the runner user as a
-#      *supplemental* group; the primary ``runner`` group is preserved.
+#      *supplemental* group; the primary ``runner`` group is
+#      preserved.
 #   3. Rebuilds the runtime tree from ``/opt/actions-runner`` and
 #      overlays the persisted registration files onto it.
-#   4. Launches ``run.sh`` directly via ``gosu`` with no runtime
-#      flags. ``--disableupdate`` is set at registration and persists
-#      in the ``.runner`` manifest.
+#   4. Seeds the persistent browser volume from the baked image
+#      cache only on the first start; subsequent starts use the
+#      existing contents.
+#   5. Launches ``run.sh`` directly via ``gosu`` with no runtime
+#      flags. ``--disableupdate`` is set at registration and
+#      persists in the ``.runner`` manifest.
 #
 # Environment variables
 # =====================
@@ -57,6 +76,9 @@
 #                       ``/var/lib/titan-runner/work``.
 #   RUNNER_BROWSER_DIR  Persistent Playwright cache. Default
 #                       ``/var/lib/titan-runner/browser``.
+#   RUNNER_BROWSER_SEED Baked image cache the persistent volume is
+#                       seeded from on first start. Default
+#                       ``/home/runner/.cache/ms-playwright``.
 #   RUNNER_ROOT         Image-owned source tree. Default
 #                       ``/opt/actions-runner``.
 #
@@ -79,6 +101,7 @@ RUNNER_STATE_DIR="${RUNNER_STATE_DIR:-/var/lib/titan-runner/state}"
 RUNNER_RUNTIME_DIR="${RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}"
 RUNNER_WORK_DIR="${RUNNER_WORK_DIR:-/var/lib/titan-runner/work}"
 RUNNER_BROWSER_DIR="${RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}"
+RUNNER_BROWSER_SEED="${RUNNER_BROWSER_SEED:-/home/runner/.cache/ms-playwright}"
 RUNNER_ROOT="${RUNNER_ROOT:-/opt/actions-runner}"
 
 # Refuse to start without configured state. A fresh container without
@@ -146,12 +169,31 @@ chmod 0640 "$RUNNER_RUNTIME_DIR/.runner"
 chmod 0600 "$RUNNER_RUNTIME_DIR/.credentials" \
           "$RUNNER_RUNTIME_DIR/.credentials_rsaparams" 2>/dev/null || true
 
-# Materialise the Playwright cache link so downloaded browser
-# binaries land in the persistent browser volume.
-ln -sfn "$RUNNER_BROWSER_DIR" /home/runner/.cache/ms-playwright 2>/dev/null || true
+# Seed the persistent Playwright browser cache from the baked image
+# cache only on the first start. The volume persists across container
+# recreations; subsequent starts reuse its contents. We deliberately
+# do NOT use ``ln -sfn`` because the baked cache is a populated real
+# directory, not a target for a symlink.
+seed_browser_cache() {
+    local seed="$1" dest="$2"
+    [ -d "$seed" ] || return 0
+    # ``find`` exits 0 and prints at least one path when the
+    # destination already contains a Chromium build, so we use it
+    # as a single-shot "is the cache populated?" probe.
+    if [ -n "$(find "$dest" -mindepth 1 -maxdepth 1 -type d -name 'chromium-*' -print -quit 2>/dev/null)" ]; then
+        return 0
+    fi
+    log "seeding persistent Playwright browser cache from $seed"
+    cp -a "$seed/." "$dest/"
+}
+seed_browser_cache "$RUNNER_BROWSER_SEED" "$RUNNER_BROWSER_DIR"
+chown -R runner:runner "$RUNNER_BROWSER_DIR"
 
 log "launching persistent listener; foreground logs follow"
-if ! env HOME="$RUNNER_RUNTIME_DIR" gosu runner \
+if ! env \
+        HOME="$RUNNER_RUNTIME_DIR" \
+        PLAYWRIGHT_BROWSERS_PATH="$RUNNER_BROWSER_DIR" \
+        gosu runner \
         "$RUNNER_RUNTIME_DIR/run.sh"; then
     fail "listener exited non-zero" 4
 fi

@@ -54,6 +54,8 @@ runner container
         |                                    can publish on host fs
         |
         +--- titan-runner-browser volume    Playwright cache
+        |                                    seeded from the baked
+        |                                    image cache on first start
         |
         +--- /var/run/docker.sock/          host bind mount
                                              daemon access as supplemental group
@@ -69,13 +71,13 @@ overrides the entrypoint for the one-shot phases:
 
 ## Quick start (dedicated CI host)
 
-Prepare the host once:
+Prepare the host once. Only the `_work` directory is a host bind
+mount; the persistent `state` and `browser` storage are Docker-named
+volumes that Compose creates automatically.
 
 ```bash
-sudo mkdir -p /var/lib/titan-runner/{state,work,browser,runtime}
-sudo chown -R 1001:1001 /var/lib/titan-runner
-sudo chmod 0750 /var/lib/titan-runner/{state,work,browser,runtime}
-sudo mkdir -p /run/secrets
+sudo install -d -m 0750 -o 1001 -g 1001 /var/lib/titan-runner/work
+sudo install -d -m 0700 /run/secrets
 ```
 
 Then:
@@ -155,7 +157,7 @@ Then:
 | State | `titan-runner-state` volume holds the Actions runner credentials |
 | Runtime | disposable materialised tree at `/var/lib/titan-runner/runtime/`; rebuilt on every container start |
 | Work | host bind mount at `/var/lib/titan-runner/work` &mdash; identical path inside and outside so child service containers share the workspace |
-| Browser | `titan-runner-browser` volume holds the Playwright cache |
+| Browser | `titan-runner-browser` volume holds the Playwright cache; seeded from the baked image cache on first start |
 | Lifecycle lock | `flock /var/lock/titan-runner.lock` around `register`, `up`, `down` |
 | Image pin | every deployment references `ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest>` |
 | Host rotation | rotate the host by preserving the `titan-runner-state` volume and `/var/lib/titan-runner/work`; no new token is required |

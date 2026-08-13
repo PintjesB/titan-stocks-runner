@@ -112,7 +112,7 @@ RUN apt-get update \
         libnspr4 \
         libnss3 \
         libpango-1.0-0 \
-        libpangocairo-1.0-0t64 \
+        libpangocairo-1.0-0 \
         libx11-6 \
         libxcb1 \
         libxcomposite1 \
@@ -191,14 +191,28 @@ COPY --chown=root:root scripts/fetch-runner.sh /usr/local/bin/fetch-runner
 RUN chmod 0755 /usr/local/bin/fetch-runner \
  && /usr/local/bin/fetch-runner
 
+# Install a deterministic ``playwright-core`` dependency tree that the
+# capability probe consumes at runtime. A committed ``package-lock.json``
+# pins the resolved version so the image is reproducible without ever
+# invoking ``npx`` at probe time. ``npx`` interprets its first positional
+# argument as a binary to execute, not a package to install, so it
+# cannot be used to "install playwright-core and then run node".
+COPY scripts/probe-package.json /opt/titan-probe/package.json
+COPY scripts/probe-package-lock.json /opt/titan-probe/package-lock.json
+RUN cd /opt/titan-probe && npm ci --omit=dev --no-audit --no-fund \
+ && npm cache clean --force
+
 # Install Playwright system browsers as the runner user. The Chromium
-# binary is reused for both ``npx playwright test`` runs and the
+# binary is reused for both Playwright application runs and the
 # ``probe`` capability check. We install only the Chromium binary (the
-# OS libraries were installed earlier in this Dockerfile).
+# OS libraries were installed earlier in this Dockerfile) into the
+# baked image cache, which ``start-runner`` seeds into the persistent
+# browser volume on first start.
 USER runner
 WORKDIR /home/runner
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/runner/.cache/ms-playwright
-RUN npx --yes playwright@${PLAYWRIGHT_VERSION} install chromium
+RUN /opt/titan-probe/node_modules/.bin/playwright install chromium \
+ && ls -1 /home/runner/.cache/ms-playwright
 
 USER root
 
