@@ -61,8 +61,8 @@ Five rules apply:
 
 Rebuild the VM if runner integrity is in doubt. The container
 boundary is *not* the recovery boundary. After a suspected
-compromise, revoke the runner and discard the VM, credentials,
-volumes, and workspace; never copy them into the replacement.
+compromise, revoke the runner and discard the VM, credentials, and
+all three runner-owned volumes; never copy them into the replacement.
 The new VM registers normally with fresh state and a fresh
 token.
 
@@ -243,7 +243,8 @@ performs a bounded cleanup after every workflow job:
   documented Titan CI prefix `titan-stocks-playwright-` only,
   identified through the `com.docker.compose.project` label.
   `docker compose down -v` removes each project's containers,
-  its bridge network, and its anonymous volumes.
+  its bridge network, and its project-owned volumes; external
+  runner volumes are never removed.
 * It removes anonymous Docker volumes whose
   `com.docker.compose.project` label matches the same prefix
   (defensive catch-all for volumes whose owning container was
@@ -255,8 +256,8 @@ performs a bounded cleanup after every workflow job:
   any application development volume, and any unrelated
   workspace is left alone.
 * The runner container itself (`titan-runner`), the
-  persistent `titan-runner-state` and `titan-runner-browser`
-  named volumes, the work host bind mount, the application
+  persistent `titan-runner-state`, `titan-runner-work`, and
+  `titan-runner-browser` named volumes, the application
   `titan_postgres` and `titan_data` named volumes, and any
   non-CI Titan workload are untouched.
 * It never invokes `docker system prune`, `docker volume

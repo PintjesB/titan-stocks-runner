@@ -15,7 +15,7 @@ services:
       RUNNER_LABELS: ${TITAN_RUNNER_LABELS:-titan-ci}
       RUNNER_STATE_DIR: ${TITAN_RUNNER_STATE_DIR:-/var/lib/titan-runner/state}
       RUNNER_RUNTIME_DIR: ${TITAN_RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}
-      RUNNER_WORK_DIR: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
+      RUNNER_WORK_DIR: /var/lib/titan-runner/work
       RUNNER_BROWSER_DIR: ${TITAN_RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}
       RUNNER_ROOT: ${TITAN_RUNNER_ROOT:-/opt/actions-runner}
       # The startup entrypoint consumes this token during registration,
@@ -27,11 +27,7 @@ services:
       # The Docker socket grants substantial host access.
       - /var/run/docker.sock:/var/run/docker.sock
       - titan-runner-state:/var/lib/titan-runner/state
-      - type: bind
-        source: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
-        target: ${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}
-        bind:
-          create_host_path: true
+      - titan-runner-work:/var/lib/titan-runner/work
       - titan-runner-browser:/var/lib/titan-runner/browser
     healthcheck:
       test:
@@ -57,5 +53,7 @@ networks:
 volumes:
   titan-runner-state:
     name: titan-runner-state
+  titan-runner-work:
+    name: titan-runner-work
   titan-runner-browser:
     name: titan-runner-browser

@@ -92,7 +92,6 @@ ALLOWLIST_KEYS=(
     TITAN_RUNNER_TOKEN
     TITAN_RUNNER_STATE_DIR
     TITAN_RUNNER_RUNTIME_DIR
-    TITAN_RUNNER_WORK_DIR
     TITAN_RUNNER_BROWSER_DIR
     TITAN_RUNNER_ROOT
     TITAN_RUNNER_STATE_VOLUME
@@ -342,7 +341,6 @@ case "$action" in
             -e RUNNER_LABELS="${TITAN_RUNNER_LABELS:-titan-ci}" \
             -e RUNNER_STATE_DIR="${TITAN_RUNNER_STATE_DIR:-/var/lib/titan-runner/state}" \
             -e RUNNER_RUNTIME_DIR="${TITAN_RUNNER_RUNTIME_DIR:-/var/lib/titan-runner/runtime}" \
-            -e RUNNER_WORK_DIR="${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}" \
             -e RUNNER_BROWSER_DIR="${TITAN_RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}" \
             -e RUNNER_ROOT="${TITAN_RUNNER_ROOT:-/opt/actions-runner}" \
             "$TITAN_RUNNER_IMAGE"
@@ -437,6 +435,13 @@ case "$action" in
         else
             echo "volume not created"
         fi
+        for volume in titan-runner-work titan-runner-browser; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then
+                printf '%s : present\n' "$volume"
+            else
+                printf '%s : not created\n' "$volume"
+            fi
+        done
         echo "=== Env file ==="
         printf '%s : %s\n' \
             "${TITAN_RUNNER_ENV_FILE:-$ROOT_DIR/.env}" \

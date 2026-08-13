@@ -19,8 +19,8 @@ Lifecycle invariants covered here:
   naming (amd64 -> x64, arm64 -> arm64), selects the matching
   pinned digest, and refuses every other architecture before any
   download attempt.
-* The persistent state layout is named volume + host bind mount,
-  not a single container filesystem.
+* The persistent state layout uses explicit Docker-named volumes,
+  with the Docker socket as the only host bind mount.
 * ``deploy.sh probe`` uses ``--entrypoint`` to override the image's
   default listener entrypoint; ``deploy.sh up`` is the sole
   registration-and-start lifecycle command.
@@ -28,8 +28,8 @@ Lifecycle invariants covered here:
   and ``start-runner.sh`` unsets it before launching the listener.
 * The listener runs only ``run.sh`` with no runtime
   ``--start``/``--disableupdate`` flags.
-* The Compose contract mounts the host work directory at the same
-  absolute path inside the container.
+* The Compose contract mounts the named work volume at the fixed
+  `/var/lib/titan-runner/work` path.
 * Persistent volumes declare an explicit ``name:`` so
   ``docker run`` and ``docker compose`` references resolve to the
   same Docker volume.
@@ -88,7 +88,6 @@ DEPLOY_ALLOWLIST_KEYS = {
     "TITAN_RUNNER_TOKEN",
     "TITAN_RUNNER_STATE_DIR",
     "TITAN_RUNNER_RUNTIME_DIR",
-    "TITAN_RUNNER_WORK_DIR",
     "TITAN_RUNNER_BROWSER_DIR",
     "TITAN_RUNNER_ROOT",
     "TITAN_RUNNER_STATE_VOLUME",
@@ -235,8 +234,8 @@ def test_register_reads_runner_token_from_env_var() -> None:
 
     The previous contract read the token from a 0600 file at
     ``RUNNER_TOKEN_FILE``. That interface is now forbidden: the
-    token is supplied through the Compose registration service as
-    ``RUNNER_TOKEN``, consumed in memory, and unset immediately
+    token is supplied through the sole Compose runner service as
+    ``RUNNER_TOKEN``, consumed in memory during startup, and unset immediately
     after ``config.sh`` returns. An empty ``RUNNER_TOKEN`` is the
     supported steady-state path after the operator blanks
     ``TITAN_RUNNER_TOKEN`` in ``.env``.
@@ -463,38 +462,31 @@ def test_compose_pins_image_and_attaches_to_bridge_network() -> None:
         assert marker in text, f"docker-compose.yml must declare {marker!r}"
 
 
-def test_compose_binds_work_directory_at_same_absolute_path() -> None:
-    """The ``_work`` directory MUST be a host/container bind mount
-    whose source and target resolve to the same absolute path so
-    the host Docker daemon publishes child service-container
-    artefacts into the same workspace the listener sees.
+def test_compose_mounts_work_as_named_volume() -> None:
+    """The workspace MUST use the explicit Docker-named work volume.
 
-    The previous contract used a Compose-managed named volume; the
-    new contract requires an identical host/container bind mount
-    because workflow service containers started by the host Docker
-    daemon must publish into the same absolute path the listener
-    reads. A named volume would mean the host daemon's view of the
-    workspace diverges from the listener's view; a bind mount with
-    different source and target would resolve the container path on
-    the host at a different location. Both forms are explicitly
-    forbidden.
+    The Docker socket remains the only host bind mount. Consumer job
+    Compose files must mount this same named volume explicitly when
+    child containers need access to the checkout.
     """
-    text = _read(COMPOSE_FILE)
-    # The work mount MUST be a bind mount, not a named volume.
-    assert "- titan-runner-work:/var/lib/titan-runner/work" not in text, (
-        "docker-compose.yml MUST NOT mount titan-runner-work as a "
-        "named volume; the contract requires an identical "
-        "host/container bind mount"
-    )
-    assert "type: bind" in text, (
-        "docker-compose.yml must declare the work mount as a bind mount"
-    )
-    # The named work volume MUST be gone from the volumes block.
-    volumes_block = text.split("volumes:", 1)[1]
-    assert "name: titan-runner-work" not in volumes_block, (
-        "docker-compose.yml must NOT declare a `titan-runner-work` "
-        "named volume; the contract requires a bind mount"
-    )
+    import yaml
+
+    with COMPOSE_FILE.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    runner = data["services"]["runner"]
+    volumes = runner.get("volumes", [])
+    assert "titan-runner-work:/var/lib/titan-runner/work" in volumes
+    assert any(
+        isinstance(entry, str) and entry == "/var/run/docker.sock:/var/run/docker.sock"
+        for entry in volumes
+    ), "Docker socket must remain the only host bind mount"
+    assert not any(
+        isinstance(entry, dict)
+        and entry.get("type") == "bind"
+        and entry.get("target") != "/var/run/docker.sock"
+        for entry in volumes
+    ), "runner must not declare a workspace bind mount"
+    assert data["volumes"]["titan-runner-work"] == {"name": "titan-runner-work"}
 
 
 def test_compose_passes_startup_token_without_file_mount() -> None:
@@ -688,6 +680,16 @@ def test_deploy_token_is_forwarded_by_compose_environment() -> None:
     assert "-e TITAN_RUNNER_TOKEN=" not in text
 
 
+def test_workspace_path_is_not_publicly_configurable() -> None:
+    """The workspace path MUST stay fixed and out of public config."""
+    for path in (ENV_EXAMPLE, DEPLOY_SCRIPT, COMPOSE_FILE, PROBE_SCRIPT):
+        assert "TITAN_RUNNER_WORK_DIR" not in _read(path), (
+            f"{path.name} must not expose TITAN_RUNNER_WORK_DIR"
+        )
+    compose = _read(COMPOSE_FILE)
+    assert "RUNNER_WORK_DIR: /var/lib/titan-runner/work" in compose
+
+
 def test_deploy_takes_exclusive_lock_for_lifecycle_mutations() -> None:
     """``deploy.sh`` up/down MUST take an exclusive flock."""
     text = _read(DEPLOY_SCRIPT)
@@ -701,6 +703,16 @@ def test_deploy_takes_exclusive_lock_for_lifecycle_mutations() -> None:
         assert "take_lock" in branch, (
             f"deploy.sh {sub!r} must take the lifecycle lock"
         )
+
+
+def test_deploy_down_preserves_runner_named_volumes() -> None:
+    """The down lifecycle MUST stop the container without removing volumes."""
+    text = _read(DEPLOY_SCRIPT)
+    down_branch = text.split("down)", 1)[1].split("logs)", 1)[0]
+    assert "docker compose" in down_branch
+    assert "--remove-orphans" in down_branch
+    assert " down -v" not in down_branch
+    assert "--volumes" not in down_branch
 
 
 def test_deploy_status_reports_runner_health_signals() -> None:
@@ -753,7 +765,7 @@ def test_dockerfile_uses_correct_pangocairo_package() -> None:
 
 
 def test_compose_volumes_have_explicit_names() -> None:
-    """Both persistent volumes MUST declare an explicit ``name:``.
+    """All three persistent volumes MUST declare an explicit ``name:``.
 
     Without ``name:``, Docker Compose scopes the volume by the
     project name (e.g. ``titan-stocks-runner_titan-runner-state``),
@@ -769,6 +781,9 @@ def test_compose_volumes_have_explicit_names() -> None:
     )
     assert "name: titan-runner-browser" in volumes_block, (
         "docker-compose.yml must declare name: titan-runner-browser"
+    )
+    assert "name: titan-runner-work" in volumes_block, (
+        "docker-compose.yml must declare name: titan-runner-work"
     )
 
 
@@ -788,19 +803,11 @@ def test_compose_bridge_network_has_explicit_name() -> None:
     )
 
 
-def test_compose_work_bind_mount_has_identical_source_and_target() -> None:
-    """The workspace bind mount MUST use identical absolute source
-    and target paths and MUST enable Compose host-path creation.
+def test_compose_work_volume_is_fixed_and_named() -> None:
+    """The workspace MUST use the named volume at the fixed path.
 
-    A bind mount whose source and target differ would resolve the
-    container path on the host at a different location than the
-    listener sees, breaking the contract that workflow service
-    containers started by the host Docker daemon can publish
-    artefacts into the same workspace the listener reads.
-
-    The startup registration phase and listener share this mount in
-    the same container, so the listener sees the exact host path used
-    by child service containers.
+    Child job Compose files mount this same external volume when they
+    need access to checkout files; no host workspace path is shared.
     """
     import yaml
 
@@ -811,36 +818,16 @@ def test_compose_work_bind_mount_has_identical_source_and_target() -> None:
     runner = services.get("runner")
     assert isinstance(runner, dict), "runner service must parse as a mapping"
 
-    bind_mounts = [
-        v for v in runner.get("volumes", [])
-        if isinstance(v, dict) and v.get("type") == "bind"
-    ]
-    work_mounts = [
-        v for v in bind_mounts
-        if isinstance(v.get("target"), str)
-        and "titan-runner/work" in v["target"]
-    ]
-    assert work_mounts, "runner must declare a bind mount for the work directory"
-    mount = work_mounts[0]
-    assert "create_host_path" not in mount
-    assert mount.get("bind", {}).get("create_host_path") is True
-    source = mount.get("source")
-    target = mount.get("target")
-    assert source and target
-    assert source == target, (
-        f"runner work bind mount source and target must be identical "
-        f"(source={source!r}, target={target!r})"
-    )
-
-    # The volumes block MUST NOT declare a named ``titan-runner-work``
-    # volume; the contract has moved to a bind mount.
-    volumes = data.get("volumes")
-    if isinstance(volumes, dict):
-        assert "titan-runner-work" not in volumes, (
-            "docker-compose.yml MUST NOT declare a named "
-            "titan-runner-work volume; the workspace is now a "
-            "host/container bind mount"
-        )
+    mounts = runner.get("volumes", [])
+    assert "titan-runner-work:/var/lib/titan-runner/work" in mounts
+    assert "/var/run/docker.sock:/var/run/docker.sock" in mounts
+    assert not any(
+        isinstance(mount, dict)
+        and mount.get("type") == "bind"
+        and mount.get("target") != "/var/run/docker.sock"
+        for mount in mounts
+    ), "runner must not declare a workspace bind mount"
+    assert data["volumes"]["titan-runner-work"] == {"name": "titan-runner-work"}
 
 
 def test_compose_omits_duplicate_init() -> None:
@@ -1029,7 +1016,7 @@ def test_post_job_hook_only_removes_titan_prefixed_resources() -> None:
     """The post-job hook MUST remove only Titan CI Compose
     projects (matched by the documented ``titan-stocks-playwright-``
     prefix and the ``com.docker.compose.project`` label) and the
-    anonymous volumes that belong to those projects. It must NEVER
+    project-owned volumes that belong to those projects. It must NEVER
     run a global prune and must NEVER touch the persistent named
     volumes or the Playwright browser cache.
 
@@ -1067,6 +1054,22 @@ def test_post_job_hook_only_removes_titan_prefixed_resources() -> None:
         assert marker not in code_only, (
             f"post-job.sh must NEVER invoke {marker!r}"
         )
+    assert "docker volume rm titan-runner-" not in code_only
+    assert "titan-runner-state" in text
+    assert "titan-runner-work" in text
+    assert "titan-runner-browser" in text
+    assert "titan-runner-state|titan-runner-work|titan-runner-browser" in code_only
+
+
+def test_child_job_external_workspace_contract_is_documented() -> None:
+    """Operator docs MUST define the external child-job work volume."""
+    docs = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (README_FILE, QUICK_START_DOC, OPERATIONS_DOC)
+    )
+    assert "external: true" in docs
+    assert "name: titan-runner-work" in docs
+    assert "titan-runner-work:/var/lib/titan-runner/work" in docs
 
 
 def test_deploy_populates_env_file_before_require_checks() -> None:
@@ -1193,12 +1196,8 @@ def test_compose_enables_actions_runner_hooks() -> None:
     sufficient.
     """
     text = _read(COMPOSE_FILE)
-    # Locate the runner service's environment block, which is the
-    # second occurrence of ``environment:`` in the file (the
-    # first belongs to the ``register`` service). The runner
-    # service is the second service under ``services:`` so its
-    # body runs until the next sibling service or the closing
-    # ``networks:`` block.
+    # Locate the runner service's environment block. The runner
+    # body runs until the top-level ``networks:`` block.
     services_block = text.split("services:", 1)[1]
     runner_section = services_block.split("runner:", 1)[1]
     runner_section = runner_section.split("\nnetworks:", 1)[0]
@@ -1920,7 +1919,7 @@ def test_env_example_uses_arch_neutral_label_and_no_targetarch() -> None:
 
 def test_compose_runtime_does_not_set_targetarch() -> None:
     """The Compose manifest MUST NOT set ``TARGETARCH`` on the
-    listener or registration services.
+    runner service.
 
     Architecture is a build / platform property, not an operator
     override; the listener reads its native architecture from
@@ -2149,11 +2148,11 @@ def test_start_runner_runs_registration_before_listener() -> None:
 
 def test_compose_runner_mounts_state_and_work() -> None:
     """The sole runner service owns both registration and listener
-    mounts, including state and the identical work bind mount."""
+    mounts, including state and the named work volume."""
     text = _read(COMPOSE_FILE)
     assert "titan-runner-state:/var/lib/titan-runner/state" in text
-    assert "type: bind" in text
-    assert "create_host_path: true" in text
+    assert "titan-runner-work:/var/lib/titan-runner/work" in text
+    assert "/var/run/docker.sock:/var/run/docker.sock" in text
 
 
 def test_register_serializes_through_state_lock() -> None:
@@ -2873,7 +2872,7 @@ def test_publish_workflow_validates_compose_contract() -> None:
     """The publish workflow contract job MUST parse the Compose
     contract and confirm the single-container startup lifecycle.
     Without this step a regression that adds a disposable service
-    or drops the identical host/container work bind mount ships
+    or drops the fixed named workspace-volume contract ships
     unnoticed.
 
     The contract validation prefers ``docker compose config`` with

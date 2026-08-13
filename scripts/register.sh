@@ -61,7 +61,8 @@
 #                        already complete. Required when the persisted
 #                        identity is missing or has drifted.
 #                        Provided through the in-container environment
-#                        by the Compose registration service.
+#                        by the sole Compose runner service during
+#                        its startup registration phase.
 #   REPO_URL             Repository clone URL the runner targets
 #                        (e.g. ``https://github.com/owner/repo``).
 #   RUNNER_NAME          Display name. Defaults to

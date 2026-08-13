@@ -27,12 +27,10 @@
 #                              completely without losing the GitHub
 #                              identity.
 #
-#   /var/lib/titan-runner/work     Host bind mount used as GitHub's
-#                              ``_work`` directory. The same absolute
-#                              path exists on the Docker host so
-#                              child service containers can publish
-#                              their artefacts on the host
-#                              filesystem.
+#   /var/lib/titan-runner/work     Persistent ``titan-runner-work``
+#                              named volume used as GitHub's ``_work``
+#                              directory. Child job containers mount the
+#                              same external volume at this fixed path.
 #
 #   /var/lib/titan-runner/browser  Persistent named volume. Holds
 #                              the Playwright Chromium browser cache.
@@ -75,7 +73,8 @@
 #                       ``/var/lib/titan-runner/state``.
 #   RUNNER_RUNTIME_DIR  Disposable runtime tree. Default
 #                       ``/var/lib/titan-runner/runtime``.
-#   RUNNER_WORK_DIR     Host-visible ``_work`` directory. Default
+#   RUNNER_WORK_DIR     Fixed ``_work`` path in the persistent
+#                       ``titan-runner-work`` volume. Default
 #                       ``/var/lib/titan-runner/work``.
 #   RUNNER_BROWSER_DIR  Persistent Playwright cache. Default
 #                       ``/var/lib/titan-runner/browser``.

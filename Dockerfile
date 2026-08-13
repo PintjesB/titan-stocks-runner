@@ -270,9 +270,10 @@ RUN chmod 0755 /usr/local/bin/register \
 # ``pre-job.sh`` validates that required host capabilities and the
 # ``host.docker.internal`` alias are available before the job
 # starts. ``post-job.sh`` removes only Titan-prefixed temporary
-# Compose projects, anonymous volumes, and ``_work`` directories;
-# it never invokes ``docker system prune`` or touches unrelated
-# resources. The hooks live inside the image-owned runner tree so
+# Compose projects and their project-owned volumes; it never
+# touches the external runner volumes, invokes ``docker system prune``,
+# or recurses the persistent ``_work`` directory. The hooks live inside
+# the image-owned runner tree so
 # every materialised runtime tree carries them.
 RUN install -d -m 0755 /opt/actions-runner/.hooks
 COPY scripts/pre-job.sh /opt/actions-runner/.hooks/PreJob.sh

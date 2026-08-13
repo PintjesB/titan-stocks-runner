@@ -7,10 +7,11 @@
 #   * Exactly one service: ``runner`` (the long-running listener).
 #   * Registration runs inside the runner's startup entrypoint; there
 #     is no disposable Compose service or ``depends_on`` gate.
-#   * The workspace mount is an identical host/container bind
-#     mount; a named ``titan-runner-work`` volume is forbidden.
-#   * Persistent ``titan-runner-state`` and ``titan-runner-browser``
-#     named volumes are declared so Compose owns their lifecycle.
+#   * The workspace is the explicit ``titan-runner-work`` named volume
+#     mounted at the fixed internal path; the Docker socket is the only
+#     host bind mount.
+#   * Persistent ``titan-runner-state``, ``titan-runner-work``, and
+#     ``titan-runner-browser`` named volumes are declared explicitly.
 #
 # A regression that drops any of these surfaces blocks the
 # ``publish.yml`` workflow contract job and prevents publication.
@@ -43,7 +44,7 @@ def _load_resolved_model() -> dict | None:
     """Return the resolved Compose model.
 
     Prefers ``docker compose config`` so variable interpolation,
-    bind-mount resolution, and the volume declarations are
+    volume-mount resolution, and the volume declarations are
     resolved by the same engine that runs the stack. Uses the
     secret-free ``.env.example`` so the contract surface is
     checked against the same interpolation a production host
@@ -115,85 +116,74 @@ def _validate(resolved: dict | None, raw: dict) -> None:
             "to the startup registration phase"
         )
 
-    # The workspace MUST be a bind mount with identical absolute
-    # source and target paths; a named volume would mean the host
-    # Docker daemon's view of the workspace diverges from the
-    # listener's view. ``docker compose config`` resolves the
-    # ``${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}``
-    # default to the absolute path; the YAML fallback inspects
-    # the raw interpolation form so the contract is still pinned
-    # when docker is unavailable.
-    service_name, service = "runner", runner
-    if resolved is not None:
-        bind_mounts = [
-            m
-            for m in (service.get("volumes") or [])
-            if isinstance(m, dict) and m.get("type") == "bind"
+    # The workspace MUST be the named volume mounted at the fixed path.
+    # Compose resolves the short YAML form to a type=volume mapping.
+    mounts = runner.get("volumes") or []
+    work_mounts = [
+        mount
+        for mount in mounts
+        if isinstance(mount, dict)
+        and mount.get("type") == "volume"
+        and mount.get("source") == "titan-runner-work"
+        and mount.get("target") == "/var/lib/titan-runner/work"
+    ]
+    if resolved is None:
+        work_mounts = [
+            mount
+            for mount in mounts
+            if mount == "titan-runner-work:/var/lib/titan-runner/work"
         ]
-    else:
-        bind_mounts = [
-            v
-            for v in (service.get("volumes") or [])
-            if isinstance(v, dict) and v.get("type") == "bind"
-        ]
-    work_mounts = [m for m in bind_mounts if _is_work_mount(m)]
     if not work_mounts:
         _fail(
-            f"docker-compose.yml `{service_name}` service must mount the "
-            "workspace as a bind mount"
-        )
-    mount = work_mounts[0]
-    if resolved is None:
-        bind = mount.get("bind")
-        if not isinstance(bind, dict) or bind.get("create_host_path") is not True:
-            _fail(
-                f"docker-compose.yml `{service_name}` service work bind mount "
-                "must declare bind.create_host_path: true"
-            )
-    source = mount.get("source")
-    target = mount.get("target")
-    if not source or not target:
-        _fail(
-            f"docker-compose.yml `{service_name}` service work bind mount "
-            "must declare both source and target"
-        )
-    if source != target:
-        _fail(
-            f"docker-compose.yml `{service_name}` service work bind mount "
-            "source and target must be identical "
-            f"(source={source!r}, target={target!r})"
+            "docker-compose.yml `runner` service must mount the named "
+            "`titan-runner-work` volume at /var/lib/titan-runner/work"
         )
 
-    # The named work volume MUST NOT be declared; the workspace is
-    # a bind mount now.
+    # The socket is intentionally the only host bind mount.
+    if resolved is not None:
+        bind_mounts = [
+            mount
+            for mount in mounts
+            if isinstance(mount, dict) and mount.get("type") == "bind"
+        ]
+        if not any(
+            mount.get("target") == "/var/run/docker.sock"
+            for mount in bind_mounts
+        ):
+            _fail("docker-compose.yml runner must bind /var/run/docker.sock")
+        if any(
+            mount.get("target") != "/var/run/docker.sock"
+            for mount in bind_mounts
+        ):
+            _fail("docker-compose.yml runner may bind only /var/run/docker.sock")
+    else:
+        if "/var/run/docker.sock:/var/run/docker.sock" not in mounts:
+            _fail("docker-compose.yml runner must bind /var/run/docker.sock")
+        if any(
+            isinstance(mount, dict)
+            and mount.get("type") == "bind"
+            and mount.get("target") != "/var/run/docker.sock"
+            for mount in mounts
+        ):
+            _fail("docker-compose.yml runner may bind only /var/run/docker.sock")
+
+    # All three persistent runner volumes MUST be declared with stable names.
     volumes = data.get("volumes")
-    if isinstance(volumes, dict) and "titan-runner-work" in volumes:
-        _fail(
-            "docker-compose.yml MUST NOT declare a `titan-runner-work` "
-            "named volume; the workspace is now a host/container bind mount"
-        )
-
-    # Persistent state and browser volumes MUST exist.
-    if not isinstance(volumes, dict) or "titan-runner-state" not in volumes:
-        _fail(
-            "docker-compose.yml must declare the `titan-runner-state` named "
-            "volume"
-        )
-    if not isinstance(volumes, dict) or "titan-runner-browser" not in volumes:
-        _fail(
-            "docker-compose.yml must declare the `titan-runner-browser` named "
-            "volume"
-        )
-
-
-def _is_work_mount(mount: dict) -> bool:
-    target = mount.get("target")
-    return isinstance(target, str) and (
-        target == "/var/lib/titan-runner/work"
-        or target == "${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}"
-        or target.endswith("/var/lib/titan-runner/work")
-    )
-
+    if not isinstance(volumes, dict):
+        _fail("docker-compose.yml must declare the persistent named volumes")
+    for volume_name in (
+        "titan-runner-state",
+        "titan-runner-work",
+        "titan-runner-browser",
+    ):
+        definition = volumes.get(volume_name)
+        if not isinstance(definition, dict):
+            _fail(f"docker-compose.yml must declare `{volume_name}` as a volume")
+        if definition.get("name") != volume_name:
+            _fail(
+                f"docker-compose.yml `{volume_name}` volume must declare "
+                f"name: {volume_name}"
+            )
 
 def main() -> int:
     if not COMPOSE_PATH.exists():

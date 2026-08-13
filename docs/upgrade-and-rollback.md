@@ -154,8 +154,9 @@ itself; an operator must explicitly re-run
 ## Emergency rebuild (suspected compromise)
 
 The VM is disposable. After a suspected compromise, revoke the
-runner and discard the VM, credentials, volumes, and
-workspace; never copy them into the replacement. The new VM
+runner and discard the VM, credentials, all runner-owned volumes,
+and the old host workspace directory; never copy them into the
+replacement. The new VM
 registers normally with fresh state and a fresh token:
 
 ```bash

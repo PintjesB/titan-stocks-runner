@@ -48,7 +48,7 @@ has to fetch a new registration token.
 | `/opt/actions-runner` | Image-owned source tree | `root` | image default | immutable |
 | `/var/lib/titan-runner/state` | named volume `titan-runner-state` | `runner:runner` | `0750` | **yes** |
 | `/var/lib/titan-runner/runtime` | writable dir in container | `runner:runner` | `0750` | **no** |
-| `${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` | identical VM/container bind mount | `runner:runner` | `0750` | **yes** |
+| `/var/lib/titan-runner/work` | named volume `titan-runner-work` | `runner:runner` | `0750` | **yes** |
 | `/var/lib/titan-runner/browser` | named volume `titan-runner-browser` | `runner:runner` | `0750` | **yes** |
 | `/opt/titan-probe/node_modules` | Image-owned `playwright-core` install | `root` | image default | image layer |
 | `/opt/actions-runner/.hooks` | Image-owned pre/post-job hooks | `root` | `0755` | image layer |
@@ -58,14 +58,24 @@ The state directory holds `.runner`, `.credentials`,
 serialisation flock), and a sanitised `diagnostics.txt`. The
 runtime directory is wiped on every container recreation; the
 credentials overlay it from state on the next start. The work
-directory is an identical VM/container bind mount: the source
-and target both resolve to
-`${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` so the
-VM's Docker daemon view matches the listener's view; Compose
-creates the host path on demand and startup registration
-establishes `runner:runner` ownership before the listener
-starts. The contract rejects named-volume workspaces and bind
-mounts whose source and target differ.
+directory is the persistent `titan-runner-work` named volume,
+mounted at the fixed `/var/lib/titan-runner/work` path. It starts
+empty when migrating from the old host-directory layout; leave that
+old directory untouched because GitHub recreates checkouts in the
+new volume. Child-job Compose files that need checkout files must
+mount this same external volume at the same fixed path:
+
+```yaml
+volumes:
+  titan-runner-work:
+    external: true
+    name: titan-runner-work
+
+services:
+  app:
+    volumes:
+      - titan-runner-work:/var/lib/titan-runner/work
+```
 
 ## Networking
 
@@ -105,7 +115,7 @@ IPC namespace.
 | `probe`   | none | Run `probe.sh` in a one-shot container with the Docker socket bind-mounted. Uses `--entrypoint /usr/local/bin/probe`. Runs on ordinary bridge networking with the native platform. Passes `EXPECTED_ARCH` so the probe can reject an emulated/mismatched Docker daemon before the rest of the contract runs. The probe sidecar never receives the registration token. |
 | `up`      | exclusive | `docker compose up -d --force-recreate --remove-orphans`. The single runner container runs the idempotent registration phase first, then starts the listener. The token may be absent after the first registration because matching persisted identity skips GitHub. Identity drift automatically triggers transactional local re-registration before the listener starts. |
 | `down`    | exclusive | `docker compose down --remove-orphans`. State, work, and browser volumes remain on disk. |
-| `status`  | none | Report runner image digest, host architecture and platform, container state, listener process, docker socket reachability, state volume contents, bridge network mode, `shm_size`, `host.docker.internal` alias resolution, and absence of both `RUNNER_TOKEN` and `TITAN_RUNNER_TOKEN` from the listener environment. |
+| `status`  | none | Report runner image digest, host architecture and platform, container state, listener process, docker socket reachability, state/work/browser volume presence, bridge network mode, `shm_size`, `host.docker.internal` alias resolution, and absence of both `RUNNER_TOKEN` and `TITAN_RUNNER_TOKEN` from the listener environment. |
 | `logs`    | none | Tail the runner logs (`docker compose logs`). |
 
 Architecture check: `deploy.sh` maps `uname -m` to `amd64` or
@@ -143,7 +153,6 @@ The current allowlist:
 | `TITAN_RUNNER_TOKEN` | Registration token (the runner startup phase sees it; the listener process does not) |
 | `TITAN_RUNNER_STATE_DIR` | Persistent state path |
 | `TITAN_RUNNER_RUNTIME_DIR` | Disposable runtime path |
-| `TITAN_RUNNER_WORK_DIR` | Host bind-mount path shared at the same absolute path inside the runner |
 | `TITAN_RUNNER_BROWSER_DIR` | Playwright cache path |
 | `TITAN_RUNNER_ROOT` | Image-owned runner tree path |
 | `TITAN_RUNNER_STATE_VOLUME` | Named volume for state |
@@ -222,10 +231,11 @@ run on a degraded VM.
 the documented Titan CI prefix `titan-stocks-playwright-`
 (matched through the `com.docker.compose.project` label). For
 each matching project, `docker compose down -v` removes the
-project's containers, its bridge network, and its anonymous
-volumes. Named volumes (`titan-runner-state`,
-`titan-runner-browser`, any application development volume) are
-excluded by construction. The hook never recurses the runner's
+project's containers, its bridge network, and its project-owned
+volumes. The external runner volumes (`titan-runner-state`,
+`titan-runner-work`, and `titan-runner-browser`) and any application
+development volumes are excluded by construction. The hook never
+recurses the runner's
 `_work` directory, never invokes `docker system prune`,
 `docker volume prune`, `docker image prune`, `docker builder
 prune`, or `docker network prune`, and never touches the runner
@@ -306,18 +316,19 @@ cannot service jobs.
 
 ## Replacing the host
 
-The `state` named volume and the work host bind mount are the
-only pieces that must be preserved across a host rotation; the
-runtime tree, the `browser` volume, and the running container
-are disposable.
+The `titan-runner-state`, `titan-runner-work`, and
+`titan-runner-browser` named volumes are protected persistent
+storage and must be preserved across a host rotation. The runtime
+tree and running container are disposable. The previous host
+workspace directory is left untouched and is not copied into the
+new work volume.
 
 ```bash
-# Old host: stop the stack. The named volume and bind mount remain on disk.
+# Old host: stop the stack. Named volumes remain on disk.
 docker compose down
 
-# New host: transfer the titan-runner-state volume and the work
-# host bind mount (e.g. via rsync, btrfs send, or a Docker volume
-# backup plugin), then bring the stack up without re-registering.
+# New host: transfer the three named volumes with a Docker volume
+# backup/restore tool, then bring the stack up without re-registering.
 docker compose pull
 docker compose up -d
 ```
@@ -326,6 +337,6 @@ A token is only necessary when the `state` volume is empty or
 the persisted identity has drifted.
 
 After a suspected compromise, revoke the runner and discard the
-VM, credentials, volumes, and workspace; never copy them into
-the replacement. The new VM registers normally with fresh state
-and a fresh token.
+VM, credentials, all runner-owned volumes, and the old host
+workspace directory; never copy them into the replacement. The
+new VM registers normally with fresh state and a fresh token.

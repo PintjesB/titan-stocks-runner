@@ -123,8 +123,8 @@ jobs:
         run: |
           set -euo pipefail
           # The Compose file is the one-command startup contract;
-          # a regression that adds a disposable registration service
-          # or drops the identical host/container work bind mount
+          # a regression that moves registration into a disposable service
+          # or drops the fixed named workspace-volume contract
           # MUST block the publish.
           # The contract suite already pins the structural
           # assertions in Python; this step additionally confirms

@@ -318,12 +318,11 @@ the offline entry manually from the GitHub UI.
 
 ## `_work` directory accumulates entries
 
-The post-job hook intentionally does NOT recurse into the
-runner `_work` directory. The bounded cleanup only targets
-Compose projects whose name matches
-`titan-stocks-playwright-`. Entries left behind by jobs that
-were interrupted (for example, by a runner restart) are
-cleared by the next `start-runner` invocation when the
-runtime tree is materialised; an operator-driven manual
-cleanup is rarely necessary and is out of scope for the
-hook.
+The runner `_work` directory lives in the persistent named volume
+`titan-runner-work`. The post-job hook intentionally does NOT
+recurse into it; cleanup only targets Compose projects whose name
+matches `titan-stocks-playwright-`. Entries left by interrupted
+jobs can remain after a restart. GitHub recreates checkout folders
+as needed, and operators may inspect or remove stale entries inside
+the volume during a maintenance window; automated cleanup must not
+delete the runner-owned volume.

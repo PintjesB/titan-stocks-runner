@@ -10,10 +10,10 @@
 #     Titan CI prefix ``titan-stocks-playwright-`` are torn down.
 #     The runner's own ``titan-runner`` container is left alone.
 #   * The shared Playwright browser volume and the persistent
-#     ``titan-runner-state`` and ``titan-runner-browser`` volumes
-#     are NEVER touched. ``docker compose down -v`` only removes
-#     anonymous volumes belonging to the matching project, so
-#     runner and application development volumes are excluded
+#     ``titan-runner-state``, ``titan-runner-work``, and
+#     ``titan-runner-browser`` volumes are NEVER touched.
+#     ``docker compose down -v`` removes only volumes owned by the
+#     matching child project; the external runner volumes are excluded
 #     by construction.
 #   * The shared Playwright ``.cache/ms-playwright`` and any
 #     Docker build cache are NEVER pruned.
@@ -23,7 +23,10 @@
 #   * The runner ``_work`` directory is NEVER recursed into. The
 #     bounded cleanup only targets the matching Compose projects;
 #     any non-Titan checkout, any application development volume,
-#     and any unrelated workspace is left alone.
+#     and any unrelated workspace is left alone. The runner-owned
+#     named volumes titan-runner-state, titan-runner-work, and
+#     titan-runner-browser are protected persistent storage and are
+#     never removed by this hook.
 #
 # The hook is intentionally permissive on failure: a cleanup error
 # must not fail the workflow job that just succeeded. Errors are
@@ -48,8 +51,9 @@ remove_titan_compose_projects() {
     # version, so we list the containers directly and recover the
     # Compose project label. ``docker compose --project-name <name>
     # down -v`` removes the project's containers, its bridge
-    # network, and its anonymous volumes; named volumes are left
-    # alone, so the runner and application development volumes are
+    # network, and its project-owned volumes; external volumes are
+    # left alone, so titan-runner-state, titan-runner-work,
+    # titan-runner-browser, and application development volumes are
     # never affected.
     local projects
     projects="$(docker ps -a --filter label="$compose_project_label" \
@@ -74,7 +78,8 @@ remove_titan_volumes() {
     # owns each anonymous volume, then match it against the CI
     # prefix. Only anonymous volumes whose owning container
     # carries the documented label are removed. Named volumes
-    # (such as ``titan-runner-state``, ``titan-runner-browser``,
+    # (such as ``titan-runner-state``, ``titan-runner-work``,
+    # ``titan-runner-browser``,
     # and any application development volume) are excluded by
     # construction.
     local volumes
@@ -89,6 +94,12 @@ remove_titan_volumes() {
     fi
     local volume
     for volume in $volumes; do
+        case "$volume" in
+            titan-runner-state|titan-runner-work|titan-runner-browser)
+                log "leaving protected runner volume untouched: $volume"
+                continue
+                ;;
+        esac
         log "removing Titan CI volume: $volume"
         docker volume rm "$volume" >/dev/null 2>&1 \
             || log "volume rm failed for $volume (ignored)"

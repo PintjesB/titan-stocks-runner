@@ -24,14 +24,12 @@ before the first `docker compose up -d`.
 
 ## 1. Storage tiers
 
-The runner uses four storage tiers. The persistent state and
-browser storage tiers are Docker-named volumes that Compose
-creates on the first `docker compose up -d`. The work directory
-is an identical host/container bind mount whose source and target
-both resolve to `${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}`;
-Compose creates the host path on demand (the contract forbids a
-named-volume workspace and rejects a bind mount whose source and
-target differ).
+The runner uses four storage tiers. State, work, and browser are
+explicit Docker-named volumes that Compose creates on the first
+`docker compose up -d`; the Docker socket is the only host bind
+mount. The work volume is always mounted at
+`/var/lib/titan-runner/work` and starts empty when migrating from
+the previous host-directory layout.
 
 * **`state`** &mdash; persistent Docker-named volume. Holds the
   GitHub-issued Actions runner credentials and a sanitised
@@ -41,18 +39,33 @@ target differ).
   Playwright Chromium browser cache. Compose creates the
   `titan-runner-browser` volume on first `up`; `start-runner.sh`
   seeds it from the baked image cache on the first start.
-* **`work`** &mdash; identical host/container bind mount. Used as
-  GitHub's `_work` directory. The source and target both resolve
-  to `${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` so the
-  host Docker daemon's view of the workspace matches the
-  listener's view. Compose creates the host path on demand; the
-  startup registration establishes `runner:runner` ownership before
-  the listener starts. Workflow service containers
-  started by the host Docker daemon attach the same absolute
-  path to share the runner's checkout.
+* **`work`** &mdash; persistent Docker-named volume
+  `titan-runner-work`, mounted at `/var/lib/titan-runner/work` and
+  owned by `runner:runner`. GitHub recreates checkouts there after
+  migration; the previous host workspace directory is not copied or
+  deleted. Child workflow Compose services must mount the same
+  external volume at the same fixed path when they need checkout
+  files.
 * **`runtime`** &mdash; disposable. Materialised from the image on
   every container start by `start-runner.sh`. Lives only inside
   the listener container's writable layer.
+
+Child workflow Compose contract:
+
+```yaml
+volumes:
+  titan-runner-work:
+    external: true
+    name: titan-runner-work
+
+services:
+  app:
+    volumes:
+      - titan-runner-work:/var/lib/titan-runner/work
+```
+
+Use checkout paths under `/var/lib/titan-runner/work`; host bind
+paths and workspace path overrides are not supported deployment inputs.
 
 ## 2. Configure the deployment env file
 
@@ -214,18 +227,18 @@ The single runner container is recreated without the token.
 
 ## 8. Tear down (VM rotation)
 
-When a VM is rotated, **only the `state` named volume and the
-work VM bind mount must be preserved** &mdash; the runtime
-tree, the `browser` volume, and the running container are
-disposable.
+When a VM is rotated, preserve the three named volumes
+`titan-runner-state`, `titan-runner-work`, and `titan-runner-browser`.
+The runtime tree and running container are disposable. The previous
+host workspace directory is left untouched; do not copy it into the
+new work volume.
 
 ```bash
-# Old VM: stop the container. State volume and work bind mount remain on disk.
+# Old VM: stop the container. Named volumes remain on disk.
 docker compose down
 
-# New VM: transfer the titan-runner-state volume and the work
-# VM bind mount (e.g. via rsync, btrfs send, or a Docker volume
-# backup plugin), then start without re-registering.
+# New VM: transfer the three named volumes with a Docker volume
+# backup/restore tool, then start without re-registering.
 docker compose pull
 docker compose up -d
 ```

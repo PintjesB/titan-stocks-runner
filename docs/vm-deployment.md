@@ -198,18 +198,18 @@ checks before bringing the listener up.
 
 ## VM rotation
 
-When the VM is rotated, only the persistent state volume and
-the work directory bind mount must survive the rotation. The
-`runtime` tree, the `browser` volume, and the running container
-are disposable.
+When the VM is rotated, preserve the three persistent named
+volumes: `titan-runner-state`, `titan-runner-work`, and
+`titan-runner-browser`. The `runtime` tree and running container
+are disposable. Leave the previous host workspace directory
+untouched; do not copy it into the new work volume.
 
 ```bash
-# Old VM: stop the stack. The named volume and bind mount remain on disk.
+# Old VM: stop the stack. Named volumes remain on disk.
 docker compose down
 
-# New VM: transfer the titan-runner-state volume and the work
-# host bind mount (e.g. via rsync, btrfs send, or a Docker volume
-# backup plugin), then bring the stack up without re-registering.
+# New VM: transfer the three named volumes with a Docker volume
+# backup/restore tool, then bring the stack up without re-registering.
 docker compose up -d
 ```
 
@@ -226,9 +226,10 @@ The VM is disposable. If the runner integrity is in doubt:
    copy credentials, volumes, or workspaces into the
    replacement; the new VM starts with fresh state and a fresh
    registration token.
-4. Re-transfer the `titan-runner-state` volume and the work
-   bind mount from the snapshot only when the operator intends
-   to keep the same GitHub identity.
+4. Re-transfer the `titan-runner-state`, `titan-runner-work`, and
+   `titan-runner-browser` volumes from the snapshot only when the
+   operator intends to keep the same GitHub identity. The old host
+   workspace directory is not part of the migration.
 5. Bring the stack up; the listener re-registers only if the
    persisted identity has drifted.
 

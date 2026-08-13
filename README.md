@@ -70,10 +70,9 @@ runner container
         |      .lock/register.lock          registration flock
         |      diagnostics.txt
         |
-        +--- ${TITAN_RUNNER_WORK_DIR}        runner workspace
-        |     identical host/container       (default
-        |     bind mount; both resolve        /var/lib/titan-runner/work)
-        |     to the same absolute path
+        +--- titan-runner-work volume        runner workspace
+        |     /var/lib/titan-runner/work     (fixed path; starts empty
+        |                                      on migration)
         |
         +--- titan-runner-browser volume    Playwright cache
         |                                    seeded from the baked
@@ -215,12 +214,33 @@ VM-level network isolation contract is documented in
 | Listener env | The startup shell consumes and unsets `RUNNER_TOKEN` before execing the listener; the runner then authenticates with the GitHub-issued long-lived secret persisted in `state/.credentials` |
 | State | `titan-runner-state` volume holds the Actions runner credentials |
 | Runtime | disposable materialised tree at `/var/lib/titan-runner/runtime/`; rebuilt on every container start |
-| Work | identical VM/container bind mount on `${TITAN_RUNNER_WORK_DIR:-/var/lib/titan-runner/work}` so child service containers started by the VM Docker daemon publish artefacts into the same absolute path the listener reads; Compose creates the VM path on demand; the contract rejects named-volume workspaces and bind mounts whose source and target differ |
+| Work | named volume `titan-runner-work` mounted at the fixed `/var/lib/titan-runner/work` path; it starts empty on migration and persists runner checkouts; child Compose services must mount this volume externally at the same path |
 | Browser | `titan-runner-browser` volume holds the Playwright cache; seeded from the baked image cache on first start |
-| Hygiene | pre-job hook validates VM capabilities and confirms the Docker daemon architecture matches the native runner architecture (`RUNNER_ARCH=X64`/`ARM64`); post-job hook tears down only `titan-stocks-playwright-` Compose projects (containers, networks, anonymous volumes); never recurses the runner's `_work` directory; never runs a global prune; hooks activated through `ACTIONS_RUNNER_HOOK_JOB_STARTED` and `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` |
+| Hygiene | pre-job hook validates VM capabilities and confirms the Docker daemon architecture matches the native runner architecture (`RUNNER_ARCH=X64`/`ARM64`); post-job hook tears down only `titan-stocks-playwright-` Compose projects (containers, networks, project-owned volumes); never recurses the runner's `_work` directory or removes external runner volumes; never runs a global prune; hooks activated through `ACTIONS_RUNNER_HOOK_JOB_STARTED` and `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` |
 | Lifecycle lock | `flock /var/lock/titan-runner.lock` around `up` and `down`; `register.sh` additionally holds `state/.lock/register.lock` so startup registration is serialised |
 | Image pin | every deployment references `ghcr.io/pintjesb/titan-stocks-runner@sha256:<digest>` |
-| VM rotation | rotate the VM by preserving the `titan-runner-state` volume and the VM bind mount on the work directory; no new token is required |
+| VM rotation | rotate the VM by preserving the `titan-runner-state`, `titan-runner-work`, and `titan-runner-browser` volumes; the old host workspace directory is left untouched and no new token is required |
+
+### Child-job workspace contract
+
+Workflow Compose files that need checkout files inside a child
+container must use the runner's named workspace volume explicitly:
+
+```yaml
+volumes:
+  titan-runner-work:
+    external: true
+    name: titan-runner-work
+
+services:
+  app:
+    volumes:
+      - titan-runner-work:/var/lib/titan-runner/work
+```
+
+Reference checkout paths below `/var/lib/titan-runner/work`; host-path
+bind mounts and workspace path overrides are not part of the deployment
+interface.
 
 ## Repository hygiene
 
