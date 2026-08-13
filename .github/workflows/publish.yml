@@ -458,8 +458,11 @@ jobs:
           import json, os, subprocess, sys
 
           merged = os.environ["MERGED_DIGEST"]
-          amd64 = os.environ["AMD64_DIGEST"]
-          arm64 = os.environ["ARM64_DIGEST"]
+          # The environment carries immutable image references for
+          # the merge command; the registry index exposes bare
+          # sha256 digests, so compare the same normalized form.
+          amd64 = os.environ["AMD64_DIGEST"].split("@", 1)[-1]
+          arm64 = os.environ["ARM64_DIGEST"].split("@", 1)[-1]
           image = os.environ["REGISTRY_IMAGE"]
 
           out = subprocess.check_output(

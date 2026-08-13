@@ -1597,6 +1597,10 @@ def test_publish_workflow_merges_native_manifests() -> None:
         "publish.yml merge validation MUST retry transient GHCR visibility "
         "before failing a just-pushed candidate"
     )
+    assert 'split("@", 1)[-1]' in merge_block, (
+        "publish.yml merge validation MUST normalize image@digest references "
+        "before comparing registry manifest digests"
+    )
     assert "path: ${{ runner.temp }}/inputs/amd64" in merge_block, (
         "publish.yml MUST download the amd64 digest into its own directory"
     )
