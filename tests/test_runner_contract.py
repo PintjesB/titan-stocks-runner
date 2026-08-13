@@ -1585,9 +1585,17 @@ def test_publish_workflow_merges_native_manifests() -> None:
         "publish.yml merge step MUST consume the arm64 candidate as "
         "an immutable repository@sha256:... reference"
     )
-    assert "docker buildx imagetools inspect --raw" in merge_block, (
+    assert "docker buildx imagetools inspect" in merge_block, (
         "publish.yml merge validation MUST inspect candidates through the "
         "authenticated Docker registry client"
+    )
+    assert 'awk \'$1 == "MediaType:" {print $2; exit}\'' in merge_block, (
+        "publish.yml merge validation MUST parse the authenticated Buildx "
+        "media-type output"
+    )
+    assert "sleep 10" in merge_block, (
+        "publish.yml merge validation MUST retry transient GHCR visibility "
+        "before failing a just-pushed candidate"
     )
     assert "curl --silent --show-error --fail" not in merge_block, (
         "publish.yml merge validation MUST NOT use unauthenticated registry curl"
