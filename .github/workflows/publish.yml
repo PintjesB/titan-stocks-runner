@@ -295,12 +295,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Download and validate candidate digests
-        # The two build jobs each upload a one-line file with
-        # the registry-served candidate digest. Downloading
-        # them here means the merge job operates on the *exact*
-        # digests that the matrix builds pushed, not a
-        # re-resolved candidate tag.
       - name: Download candidate digest (amd64)
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
         with:

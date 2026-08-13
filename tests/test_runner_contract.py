@@ -3093,7 +3093,14 @@ def test_workflow_files_parse_and_have_no_executable_fixed_host_ports() -> None:
     assert "jobs" in data, "publish.yml must declare jobs"
     for job_name, job in data["jobs"].items():
         steps = job.get("steps", [])
-        for step in steps:
+        for index, step in enumerate(steps, start=1):
+            assert isinstance(step, dict), (
+                f"publish.yml job {job_name!r} step {index} must be a mapping"
+            )
+            assert step.get("run") or step.get("uses"), (
+                f"publish.yml job {job_name!r} step {index} must declare "
+                "either `run` or `uses`"
+            )
             run = step.get("run", "")
             if not run:
                 continue
