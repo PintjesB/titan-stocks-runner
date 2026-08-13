@@ -1421,9 +1421,9 @@ def test_deploy_status_resolves_manifest_digest() -> None:
 
 
 def test_publish_resolves_digest_after_promote() -> None:
-    """``publish.yml`` must resolve the GHCR-served manifest digest
-    after the ``:latest`` promotion step so the reported digest is
-    definitively what the registry serves.
+    """``publish.yml`` must resolve the GHCR-served ``:latest``
+    digest after the promote-to-:latest step so the reported
+    digest is definitively what the registry serves.
     """
     import yaml
 
@@ -1435,21 +1435,30 @@ def test_publish_resolves_digest_after_promote() -> None:
         (i for i, n in enumerate(step_names) if "Promote" in n),
         None,
     )
-    digest_index = next(
+    # The :latest-resolution step runs AFTER the promote-to-:latest
+    # step so the reported digest is the digest GHCR serves. A
+    # generic ``digest`` substring would also match the
+    # download-artifact step; the contract looks for the resolve /
+    # verify / report substring.
+    resolve_index = next(
         (
             i
             for i, n in enumerate(step_names)
-            if "digest" in n.lower()
+            if any(
+                marker in n.lower()
+                for marker in ("resolve", "verify", "report", "equality")
+            )
+            and "digest" in n.lower()
         ),
         None,
     )
-    assert promote_index is not None and digest_index is not None, (
+    assert promote_index is not None and resolve_index is not None, (
         "publish.yml promote job must have a promote step and a "
-        "digest-reporting step"
+        ":latest-digest resolution step"
     )
-    assert digest_index > promote_index, (
-        "publish.yml promote job must report the digest AFTER the "
-        "promote-to-:latest step"
+    assert resolve_index > promote_index, (
+        "publish.yml promote job must re-resolve the :latest digest "
+        "AFTER the promote-to-:latest step"
     )
 
 
@@ -1532,6 +1541,12 @@ def test_publish_workflow_merges_native_manifests() -> None:
     digests into a commit-specific multi-platform manifest before
     probing the merged image or promoting it to ``:latest``.
 
+    The merge step MUST consume the candidate digests as
+    immutable ``repository@sha256:...`` references (exported
+    through temporary GitHub artifacts) so a re-pushed
+    candidate tag cannot leak into the merged manifest. Mutable
+    candidate tags are diagnostic-only after the build step.
+
     Without the merge step a deployer would have to pin two
     different digests per architecture; the contract is that one
     digest resolves to both ``linux/amd64`` and ``linux/arm64``
@@ -1542,34 +1557,114 @@ def test_publish_workflow_merges_native_manifests() -> None:
         "publish.yml must use `docker buildx imagetools create` to "
         "merge native candidates"
     )
-    assert "candidate-${" in text or "candidate-${{" in text, (
-        "publish.yml must reference the commit-specific candidate tag"
-    )
     assert "-merged" in text, (
         "publish.yml must tag the merged manifest with a -merged suffix"
+    )
+    # The merge step MUST consume the candidate digests through
+    # the upload / download-artifact round trip rather than the
+    # mutable candidate tags.
+    assert "upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text, (
+        "publish.yml must upload the candidate digests as workflow "
+        "artifacts through the pinned upload-artifact action"
+    )
+    assert "download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0" in text, (
+        "publish.yml must download the candidate digests through the "
+        "pinned download-artifact action"
+    )
+    # The merge inputs MUST be the immutable
+    # ``repository@sha256:...`` references; the merge step MUST
+    # NOT fall back to the mutable candidate tags as merge
+    # inputs.
+    merge_block = text.split("name: Merge native manifests", 1)[1]
+    merge_block = merge_block.split("name: Upload merged digest artifact", 1)[0]
+    assert "@${{ steps.validate.outputs.amd64_digest }}" in merge_block, (
+        "publish.yml merge step MUST consume the amd64 candidate as "
+        "an immutable repository@sha256:... reference"
+    )
+    assert "@${{ steps.validate.outputs.arm64_digest }}" in merge_block, (
+        "publish.yml merge step MUST consume the arm64 candidate as "
+        "an immutable repository@sha256:... reference"
     )
 
 
 def test_publish_workflow_asserts_merged_platforms() -> None:
     """The publish workflow MUST assert that the merged manifest
-    contains both ``linux/amd64`` and ``linux/arm64`` before
+    contains *exactly* ``linux/amd64`` and ``linux/arm64`` before
     promoting the digest to ``:latest``.
 
-    Provenance / attestation entries may additionally appear; the
-    assertion is platform-name driven rather than platform-count
-    driven so a future attestation pipeline does not break the
-    contract.
+    The merged index MUST NOT carry any ``unknown/unknown``
+    attestation entries. Embedded BuildKit provenance manifests
+    surface as ``unknown/unknown`` platform entries; the merge
+    step rejects nested indexes and the postcondition rejects
+    any embedded attestation manifest that survives the merge.
+
+    The contract is platform-set driven (``{amd64, arm64} ==
+    {amd64, arm64}``) rather than platform-count driven so a
+    future attestation pipeline that does not embed provenance
+    in the index does not break the contract.
     """
     text = _read(PUBLISH_WORKFLOW)
-    assert "merged index contains both architectures" in text.lower() or (
-        "both architectures" in text.lower()
+    # The postcondition MUST check for an exact digest match.
+    assert "does not contain exactly the two candidate digests" in text or (
+        "does not contain exactly" in text
     ), (
-        "publish.yml must assert the merged manifest contains both "
-        "linux/amd64 and linux/arm64"
+        "publish.yml must assert the merged index contains exactly "
+        "the two candidate digests"
     )
-    assert '"amd64"' in text and '"arm64"' in text, (
-        "publish.yml must look up the architecture names in the "
-        "merged manifest"
+    # The postcondition MUST reject unknown/unknown embedded
+    # attestation entries.
+    assert '"unknown"' in text and "unknown/unknown" in text, (
+        "publish.yml must reject unknown/unknown embedded attestation "
+        "entries in the merged index"
+    )
+    assert "platform.get(\"architecture\")" in text or (
+        "platform.architecture" in text
+    ), (
+        "publish.yml must look up the architecture field on each "
+        "manifest entry when validating the merged index"
+    )
+
+
+def test_publish_workflow_handles_imagetools_create_nonzero() -> None:
+    """The merge step MUST treat a non-zero ``imagetools create``
+    exit as an ambiguous Buildx result, NOT a hard failure.
+
+    Earlier versions of this workflow propagated the exit code
+    directly; Buildx has historically returned exit 255 after
+    publishing a manifest whose own output it could not parse.
+    The contract requires the workflow to retain the original
+    command diagnostics (``::group::`` output) and to inspect
+    GHCR before deciding whether the merge succeeded. The
+    postcondition is the authoritative gate; the merge step
+    MUST continue only when the remote merged index contains
+    exactly the two expected candidate digests.
+    """
+    text = _read(PUBLISH_WORKFLOW)
+    merge_block = text.split("name: Merge native candidates", 1)[1]
+    merge_block = merge_block.split("name: Upload merged digest artifact", 1)[0]
+    # The merge step MUST disable ``-e`` for the imagetools
+    # invocation so a non-zero exit can be inspected.
+    assert "set +e" in merge_block, (
+        "publish.yml merge step MUST disable -e for the "
+        "imagetools create invocation so a non-zero exit can "
+        "be inspected"
+    )
+    assert "create_rc=" in merge_block, (
+        "publish.yml merge step MUST capture the imagetools "
+        "create exit code"
+    )
+    assert "set -e" in merge_block, (
+        "publish.yml merge step MUST re-enable -e after the "
+        "imagetools create invocation"
+    )
+    # The original command diagnostics MUST be retained.
+    assert "imagetools-create.stderr" in merge_block, (
+        "publish.yml merge step MUST retain the imagetools "
+        "create stderr diagnostics for inspection"
+    )
+    assert "::group::imagetools create diagnostics" in merge_block, (
+        "publish.yml merge step MUST surface the imagetools "
+        "create diagnostics in a workflow log group"
     )
 
 
@@ -1579,7 +1674,10 @@ def test_publish_workflow_verifies_merged_manifest_on_both_arches() -> None:
     ``:latest``.
 
     Promotion MUST be gated on both probes passing; a regression
-    in either platform cannot ship through a partial green.
+    in either platform cannot ship through a partial green. The
+    verify job MUST consume the merged digest through the
+    download-artifact round trip so a re-resolved mutable tag
+    cannot redirect the probe.
     """
     import yaml
 
@@ -1606,13 +1704,205 @@ def test_publish_workflow_verifies_merged_manifest_on_both_arches() -> None:
         "publish.yml verify must probe the merged manifest on "
         "ubuntu-24.04-arm (linux/arm64)"
     )
+    # The verify job MUST consume the merged digest through the
+    # download-artifact round trip rather than a mutable tag.
+    import yaml
+
+    with PUBLISH_WORKFLOW.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    verify_steps = data["jobs"]["verify"]["steps"]
+    download_steps = [
+        s for s in verify_steps
+        if isinstance(s, dict)
+        and "download-artifact" in (s.get("uses") or "")
+    ]
+    assert any(
+        (s.get("with") or {}).get("name") == "merged-digest"
+        for s in download_steps
+    ), (
+        "publish.yml verify job MUST download the merged-digest "
+        "artifact before probing the merged manifest"
+    )
+    # The probe step MUST consume the merged digest from the
+    # downloaded artifact (NOT the mutable merged tag).
+    verify_text = _read(PUBLISH_WORKFLOW)
+    verify_body = verify_text.split("\n  verify:\n", 1)[1]
+    verify_body = verify_body.split("\n  attest:\n", 1)[0]
+    assert "merged-digest.txt" in verify_body, (
+        "publish.yml verify job MUST consume the merged digest "
+        "from the downloaded artifact"
+    )
+
+
+def test_publish_workflow_attests_before_promotion() -> None:
+    """The publish workflow MUST attach a registry-side provenance
+    attestation to the immutable merged digest before promoting
+    the digest to ``:latest``.
+
+    Embedded BuildKit provenance (the source of the previous
+    Buildx exit 255 after merge) is replaced by a separate
+    registry-attached attestation that runs only after both
+    native probes pass. ``:latest`` MUST be tagged only after
+    the attestation step succeeds.
+    """
+    import yaml
+
+    text = _read(PUBLISH_WORKFLOW)
+    assert "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6" in text, (
+        "publish.yml must pin the attestation action by SHA-256"
+    )
+    with PUBLISH_WORKFLOW.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    jobs = data["jobs"]
+    assert "attest" in jobs, (
+        "publish.yml must declare an `attest` job that attaches "
+        "registry-side provenance to the merged digest"
+    )
+    needs = jobs["attest"].get("needs") or []
+    if isinstance(needs, str):
+        needs = [needs]
+    assert "verify" in needs, (
+        "publish.yml attest job must `needs: verify`"
+    )
     promote_needs = jobs["promote"].get("needs") or []
     if isinstance(promote_needs, str):
         promote_needs = [promote_needs]
-    assert "verify" in promote_needs, (
-        "publish.yml promote job must `needs: verify` so promotion "
-        "is gated on both native probes passing"
+    assert "attest" in promote_needs, (
+        "publish.yml promote job must `needs: attest` so :latest "
+        "promotion is gated on the attestation step"
     )
+    # The attestation step MUST target the merged digest by name
+    # and push the attestation back to the registry.
+    attest_text = text.split("name: Attach provenance attestation", 1)[1]
+    assert "subject-name: ghcr.io/pintjesb/titan-stocks-runner" in attest_text, (
+        "publish.yml attest step MUST target the documented subject name"
+    )
+    assert "subject-digest:" in attest_text, (
+        "publish.yml attest step MUST reference the merged digest by SHA-256"
+    )
+    assert "push-to-registry: true" in attest_text, (
+        "publish.yml attest step MUST push the attestation back to the registry"
+    )
+
+
+def test_publish_workflow_attestation_permissions() -> None:
+    """The attestation job MUST declare the ``id-token``,
+    ``attestations``, and ``artifact-metadata`` write permissions
+    required by ``actions/attest`` for the keyless OIDC signing
+    flow and for ``:latest`` tag management.
+
+    The promote job MUST declare ``artifact-metadata: write`` so
+    the ``:latest`` tag update is authorised on the same
+    authenticated session.
+    """
+    import yaml
+
+    with PUBLISH_WORKFLOW.open(encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    attest_perms = data["jobs"]["attest"].get("permissions") or {}
+    required = {
+        "id-token": "write",
+        "attestations": "write",
+        "artifact-metadata": "write",
+    }
+    for key, value in required.items():
+        assert attest_perms.get(key) == value, (
+            f"publish.yml attest job must declare {key}: {value}; "
+            f"got {attest_perms.get(key)!r}"
+        )
+    promote_perms = data["jobs"]["promote"].get("permissions") or {}
+    assert promote_perms.get("packages") == "write", (
+        "publish.yml promote job must declare packages: write"
+    )
+
+
+def test_publish_workflow_promotion_requires_digest_equality() -> None:
+    """The promote job MUST re-resolve ``:latest`` from the
+    registry and require the digest to equal the merged digest.
+
+    A divergence means a concurrent push raced and tagged
+    ``:latest`` with a different manifest; the workflow MUST
+    fail rather than ship a misleading pointer. The promote
+    job MUST consume the merged digest through the
+    download-artifact round trip rather than a mutable tag.
+    """
+    text = _read(PUBLISH_WORKFLOW)
+    promote_block = text.split("name: Promote verified manifest", 1)[1]
+    assert ":latest digest (" in promote_block and (
+        "does not equal merged digest" in promote_block
+    ), (
+        "publish.yml promote job MUST re-resolve :latest and "
+        "require its digest to equal the merged digest"
+    )
+    # The promote job MUST consume the merged digest through the
+    # download-artifact round trip rather than a mutable tag.
+    promote_body = text.split("\n  promote:\n", 1)[1]
+    assert "merged-digest.txt" in promote_body, (
+        "publish.yml promote job MUST consume the merged digest "
+        "through the download-artifact round trip"
+    )
+
+
+def test_publish_workflow_disables_embedded_provenance() -> None:
+    """The build job MUST set ``provenance: false`` and
+    ``sbom: false`` on the build-push-action so the pushed
+    candidate is a plain image manifest rather than an OCI
+    index wrapping the image and embedded provenance.
+
+    Embedded BuildKit provenance caused Buildx to return exit
+    255 after publishing the merged manifest because the merge
+    step chained two nested OCI indexes; the contract requires
+    plain per-platform candidates.
+    """
+    text = _read(PUBLISH_WORKFLOW)
+    assert "provenance: false" in text, (
+        "publish.yml must disable BuildKit embedded provenance"
+    )
+    assert "sbom: false" in text, (
+        "publish.yml must disable BuildKit embedded SBOM"
+    )
+
+
+def test_publish_workflow_python_uses_os_environ() -> None:
+    """The Python verification step in the merge job MUST read
+    the merged digest from ``os.environ`` rather than
+    interpolating ``github.sha`` into a quoted heredoc.
+
+    An earlier version of this step passed the literal
+    ``${GITHUB_SHA}`` token to Python because the heredoc was
+    quoted (``<<'PY'``); the contract is that the digest is
+    consumed from the ``MERGED_DIGEST`` environment variable
+    so a re-resolution never queries a non-existent reference.
+    The scope of the regression check is the Python heredoc
+    body only; the publish workflow legitimately uses
+    ``${GITHUB_SHA}`` for diagnostic tags elsewhere.
+    """
+    text = _read(PUBLISH_WORKFLOW)
+    # The Python verification step MUST read MERGED_DIGEST from
+    # the environment.
+    assert "os.environ[\"MERGED_DIGEST\"]" in text or (
+        "os.environ['MERGED_DIGEST']" in text
+    ), (
+        "publish.yml merge step MUST read MERGED_DIGEST from "
+        "os.environ in the Python verification block"
+    )
+    # The Python heredoc body MUST NOT embed ``${GITHUB_SHA}`` (or
+    # any GitHub Actions template token) as a literal string.
+    heredoc_start = text.find("<<'PY'")
+    assert heredoc_start != -1, (
+        "publish.yml merge step MUST contain a Python heredoc"
+    )
+    heredoc_end = text.find("\n          PY", heredoc_start)
+    assert heredoc_end != -1, (
+        "publish.yml merge step Python heredoc MUST be closed"
+    )
+    heredoc_body = text[heredoc_start:heredoc_end]
+    for forbidden in ("\"${GITHUB_SHA}\"", "'${GITHUB_SHA}'", "${GITHUB_SHA}"):
+        assert forbidden not in heredoc_body, (
+            "publish.yml Python verification block MUST NOT embed a "
+            "literal ${GITHUB_SHA} token; the digest is read from "
+            "os.environ"
+        )
 
 
 def test_application_workflow_targets_arch_neutral_selector() -> None:
