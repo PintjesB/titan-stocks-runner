@@ -610,6 +610,12 @@ jobs:
         with:
           name: merged-digest
           path: ${{ runner.temp }}
+      - name: Log in to GHCR for attestation
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Resolve merged digest for attestation
         id: digest
         run: |

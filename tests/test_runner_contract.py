@@ -1814,6 +1814,11 @@ def test_publish_workflow_attests_before_promotion() -> None:
     assert "push-to-registry: true" in attest_text, (
         "publish.yml attest step MUST push the attestation back to the registry"
     )
+    attest_steps = data["jobs"]["attest"]["steps"]
+    assert any(
+        "docker/login-action@dbcb813823bdd20940b903addbd779551569679f" in (s.get("uses") or "")
+        for s in attest_steps
+    ), "publish.yml attest job MUST authenticate to GHCR before pushing provenance"
 
 
 def test_publish_workflow_attestation_permissions() -> None:
