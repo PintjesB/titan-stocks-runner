@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+
+PROFILE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = PROFILE_ROOT.parents[1]
+WRAPPER = REPO_ROOT / ".github" / "workflows" / "publish-titan.yml"
+REUSABLE = REPO_ROOT / ".github" / "workflows" / "_publish-runner.yml"
+
+
+def _yaml(path: Path) -> dict:
+    with path.open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def test_titan_wrapper_targets_profile_and_existing_image_name() -> None:
+    data = _yaml(WRAPPER)
+    job = data["jobs"]["publish"]
+    assert job["uses"] == "./.github/workflows/_publish-runner.yml"
+    assert job["with"]["profile"] == "titan"
+    assert job["with"]["image"] == "ghcr.io/pintjesb/titan-stocks-runner"
+
+
+def test_titan_wrapper_republishes_when_shared_workflow_changes() -> None:
+    text = WRAPPER.read_text(encoding="utf-8")
+    assert "'.github/workflows/_publish-runner.yml'" in text
+    assert "'runners/titan/**'" in text
+
+
+def test_reusable_publisher_runs_profile_contract_before_build() -> None:
+    data = _yaml(REUSABLE)
+    jobs = data["jobs"]
+    assert jobs["build"]["needs"] == "contract"
+    assert "./ci-contract.sh" in REUSABLE.read_text(encoding="utf-8")
+
+
+def test_reusable_publisher_builds_native_amd64_and_arm64() -> None:
+    data = _yaml(REUSABLE)
+    matrix = data["jobs"]["build"]["strategy"]["matrix"]["include"]
+    pairs = {(entry["platform"], entry["runner"]) for entry in matrix}
+    assert pairs == {
+        ("linux/amd64", "ubuntu-24.04"),
+        ("linux/arm64", "ubuntu-24.04-arm"),
+    }
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert "provenance: false" in text
+    assert "sbom: false" in text
+    assert "candidate-${{ github.sha }}-${{ matrix.tag_suffix }}" in text
+
+
+def test_reusable_publisher_uses_immutable_digest_handoff() -> None:
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in text
+    assert "actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0" in text
+    assert '"${IMAGE}@${amd64}"' in text
+    assert '"${IMAGE}@${arm64}"' in text
+
+
+def test_reusable_publisher_handles_ambiguous_imagetools_exit() -> None:
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert "set +e" in text
+    assert "create_rc=$?" in text
+    assert "imagetools create diagnostics" in text
+    assert "merged manifest could not be resolved after imagetools create" in text
+
+
+def test_reusable_publisher_validates_exact_merged_platforms() -> None:
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert '("linux", "amd64")' in text
+    assert '("linux", "arm64")' in text
+    assert "if actual != expected" in text
+    assert '"--format", "{{json .Manifest}}"' in text
+
+
+def test_reusable_publisher_probes_without_host_network_or_ipc() -> None:
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert "--add-host host.docker.internal:host-gateway" in text
+    assert "--shm-size 2gb" in text
+    assert "--network host" not in text
+    assert "--ipc host" not in text
+    assert "-e EXPECTED_ARCH=" in text
+
+
+def test_reusable_publisher_attests_before_exact_promotion() -> None:
+    data = _yaml(REUSABLE)
+    jobs = data["jobs"]
+    assert jobs["attest"]["needs"] == "verify"
+    assert jobs["promote"]["needs"] == "attest"
+    text = REUSABLE.read_text(encoding="utf-8")
+    assert "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6" in text
+    assert '"${IMAGE}@${merged}"' in text
+    assert '[ "$latest" != "$merged" ]' in text
