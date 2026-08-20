@@ -18,6 +18,7 @@ Additional profiles should be added under `runners/<name>/` rather than expandin
 ```text
 runners/
   titan/
+    VERSION
     Dockerfile
     docker-compose.yml
     deploy.sh
@@ -26,12 +27,14 @@ runners/
     tests/
     docs/
   oportunist/
+    VERSION
     Dockerfile
     docker-compose.yml
     ci-contract.sh
     scripts/
 .github/workflows/
   _publish-runner.yml
+  _tag-semver.yml
   publish-titan.yml
   publish-oportunist.yml
   validate.yml
@@ -51,20 +54,41 @@ Pull requests that touch runner profiles or workflow files run the profile contr
 6. Probe the merged manifest on both native architectures.
 7. Attach provenance to the immutable merged digest.
 8. Promote that exact digest to `:latest` and verify the registry-served digest matches.
+9. Add an independent SemVer tag for the runner profile.
 
-The reusable workflow deliberately tolerates the known Buildx case where `imagetools create` can return non-zero after the registry accepted the manifest. The remote merged-manifest postcondition remains authoritative.
+The reusable publisher deliberately tolerates the known Buildx case where `imagetools create` can return non-zero after the registry accepted the manifest. The remote merged-manifest postcondition remains authoritative.
+
+### Profile versioning
+
+Each profile has its own `VERSION` file. It contains the minimum SemVer release for that line, initially `1.0.0`.
+
+After a successful publish, `_tag-semver.yml` reads all existing GHCR version tags for that image and selects the next patch release on the configured major/minor line. Examples:
+
+```text
+runners/titan/VERSION = 1.0.0
+existing Titan tags    = 1.0.0, 1.0.1
+next Titan release     = 1.0.2
+
+runners/oportunist/VERSION = 1.0.0
+existing Oportunist tags   = 1.0.0
+next Oportunist release    = 1.0.1
+```
+
+The two profiles therefore version independently. Re-running the same already-tagged image is idempotent and reuses its existing SemVer instead of consuming another patch. To begin a new major or minor line, update that profile's `VERSION` file, for example from `1.0.0` to `1.1.0` or `2.0.0`.
+
+Deployment examples use explicit SemVer tags so Renovate can update them. `latest` is also published for manual/rolling use.
 
 ## Design rules
 
-- Runner profiles are independently buildable and deployable.
+- Runner profiles are independently buildable, versioned, and deployable.
 - Profile-specific dependencies stay inside that profile.
 - Persistent runner identity, workspaces, and Codex authentication use Docker named volumes.
 - Codex authentication is replaceable state: if its volume is deleted, authenticate again with `codex login --device-auth`.
-- Images remain pinned and tested before publication.
+- Build, verification, merge, and attestation operate on immutable digests even though deployments may consume SemVer tags.
 - The dedicated CI VM is the security boundary for runners that receive the host Docker socket.
 
 ## Deployment migration
 
-Existing runner containers do not stop because this source repository was reorganized or renamed. However, update deployment Compose files before adopting Codex or refreshing image pins. See [Compose migration after the runner repository split](docs/compose-migration.md).
+Existing runner containers do not stop because this source repository was reorganized or renamed. However, update deployment Compose files before adopting Codex or refreshing image references. See [Compose migration after the runner repository split](docs/compose-migration.md).
 
 The repository has already been renamed to `PintjesB/github-runners`. GitHub redirects the old repository URL, while the GHCR image names intentionally remain unchanged.
