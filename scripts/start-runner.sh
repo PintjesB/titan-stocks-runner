@@ -179,7 +179,7 @@ install -d -m 0750 -o runner -g runner \
     "$RUNNER_WORK_DIR" \
     "$RUNNER_BROWSER_DIR" \
     "$CODEX_HOME"
-chown runner:runner "$CODEX_HOME"
+chown -R runner:runner "$CODEX_HOME"
 
 # Rebuild the runtime tree from the immutable image tree. The runner
 # reads ``.runner`` and ``.credentials*`` from ``$HOME`` at startup,
