@@ -1,0 +1,180 @@
+name: reusable-runner-semver
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: Runner profile directory name under runners/
+        required: true
+        type: string
+      image:
+        description: GHCR image name without a tag
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  tag:
+    name: Tag ${{ inputs.profile }} SemVer
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Select profile version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ inputs.image }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+
+          version_file="runners/${PROFILE}/VERSION"
+          if [ ! -s "$version_file" ]; then
+            echo "::error::missing or empty version floor: $version_file"
+            exit 1
+          fi
+
+          base="$(tr -d '[:space:]' < "$version_file")"
+          if [[ ! "$base" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::$version_file must contain a SemVer core such as 1.0.0 (got: $base)"
+            exit 1
+          fi
+
+          latest_digest="$(docker buildx imagetools inspect "${IMAGE}:latest" \
+            | awk '$1 == "Digest:" {print $2; exit}')"
+          if [[ ! "$latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::invalid latest digest: $latest_digest"
+            exit 1
+          fi
+
+          case "$IMAGE" in
+            ghcr.io/*/*) ;;
+            *)
+              echo "::error::SemVer tagging currently supports ghcr.io images only: $IMAGE"
+              exit 1
+              ;;
+          esac
+
+          image_path="${IMAGE#ghcr.io/}"
+          owner="${image_path%%/*}"
+          package="${image_path#*/}"
+          encoded_package="$(python3 - "$package" <<'PY'
+          import sys
+          import urllib.parse
+          print(urllib.parse.quote(sys.argv[1], safe=""))
+          PY
+          )"
+
+          raw_versions="$RUNNER_TEMP/package-versions.raw.json"
+          versions="$RUNNER_TEMP/package-versions.json"
+          gh api --paginate \
+            "/users/${owner}/packages/container/${encoded_package}/versions?per_page=100" \
+            > "$raw_versions"
+          jq -s 'add // []' "$raw_versions" > "$versions"
+
+          version="$(python3 - "$base" "$latest_digest" "$versions" <<'PY'
+          import json
+          import re
+          import sys
+
+          base, current_digest, path = sys.argv[1:]
+          match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", base)
+          if not match:
+              raise SystemExit(f"invalid base SemVer: {base}")
+
+          major, minor, floor_patch = map(int, match.groups())
+          with open(path, encoding="utf-8") as handle:
+              versions = json.load(handle)
+
+          line_patches = []
+          current_digest_patches = []
+          tag_re = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+          for package_version in versions:
+              digest = package_version.get("name", "")
+              tags = ((package_version.get("metadata") or {}).get("container") or {}).get("tags") or []
+              for tag in tags:
+                  tag_match = tag_re.fullmatch(tag)
+                  if not tag_match:
+                      continue
+                  tag_major, tag_minor, tag_patch = map(int, tag_match.groups())
+                  if (tag_major, tag_minor) != (major, minor):
+                      continue
+                  line_patches.append(tag_patch)
+                  if digest == current_digest and tag_patch >= floor_patch:
+                      current_digest_patches.append(tag_patch)
+
+          # Re-running the same successfully published image is idempotent:
+          # reuse its existing SemVer instead of consuming another patch.
+          if current_digest_patches:
+              patch = max(current_digest_patches)
+          else:
+              highest = max(line_patches, default=floor_patch - 1)
+              patch = max(floor_patch, highest + 1)
+
+          print(f"{major}.{minor}.{patch}")
+          PY
+          )"
+
+          printf 'base version   : %s\n' "$base"
+          printf 'latest digest  : %s\n' "$latest_digest"
+          printf 'selected version: %s\n' "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "digest=$latest_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Tag exact digest and verify
+        env:
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          EXPECTED_DIGEST: ${{ steps.version.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          existing="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" 2>/dev/null \
+            | awk '$1 == "Digest:" {print $2; exit}' || true)"
+
+          if [ -n "$existing" ]; then
+            if [ "$existing" != "$EXPECTED_DIGEST" ]; then
+              echo "::error::version collision: ${IMAGE}:${VERSION} already points to $existing"
+              exit 1
+            fi
+            echo "${IMAGE}:${VERSION} already points to the current digest; keeping it"
+          else
+            docker buildx imagetools create \
+              --tag "${IMAGE}:${VERSION}" \
+              "${IMAGE}@${EXPECTED_DIGEST}"
+          fi
+
+          version_digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
+            | awk '$1 == "Digest:" {print $2; exit}')"
+          latest_digest="$(docker buildx imagetools inspect "${IMAGE}:latest" \
+            | awk '$1 == "Digest:" {print $2; exit}')"
+
+          if [ "$version_digest" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::${IMAGE}:${VERSION} resolved to $version_digest, expected $EXPECTED_DIGEST"
+            exit 1
+          fi
+          if [ "$latest_digest" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::latest moved during SemVer tagging: $latest_digest != $EXPECTED_DIGEST"
+            exit 1
+          fi
+
+          echo "published ${IMAGE}:${VERSION} and ${IMAGE}:latest -> ${EXPECTED_DIGEST}"
