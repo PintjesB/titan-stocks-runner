@@ -18,6 +18,7 @@ services:
       RUNNER_WORK_DIR: /var/lib/titan-runner/work
       RUNNER_BROWSER_DIR: ${TITAN_RUNNER_BROWSER_DIR:-/var/lib/titan-runner/browser}
       RUNNER_ROOT: ${TITAN_RUNNER_ROOT:-/opt/actions-runner}
+      CODEX_HOME: /home/runner/.codex
       # The startup entrypoint consumes this token during registration,
       # unsets it, and then execs the persistent listener.
       RUNNER_TOKEN: ${TITAN_RUNNER_TOKEN:-}
@@ -29,6 +30,8 @@ services:
       - titan-runner-state:/var/lib/titan-runner/state
       - titan-runner-work:/var/lib/titan-runner/work
       - titan-runner-browser:/var/lib/titan-runner/browser
+      # ChatGPT/Codex login state. Deleting this volume only requires re-login.
+      - titan-runner-codex:/home/runner/.codex
     healthcheck:
       test:
         - CMD-SHELL
@@ -57,3 +60,5 @@ volumes:
     name: titan-runner-work
   titan-runner-browser:
     name: titan-runner-browser
+  titan-runner-codex:
+    name: titan-runner-codex
