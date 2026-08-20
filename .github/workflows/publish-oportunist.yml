@@ -6,6 +6,7 @@ on:
     paths:
       - 'runners/oportunist/**'
       - '.github/workflows/_publish-runner.yml'
+      - '.github/workflows/_tag-semver.yml'
       - '.github/workflows/publish-oportunist.yml'
   workflow_dispatch:
 
@@ -24,6 +25,16 @@ jobs:
       attestations: write
       artifact-metadata: write
     uses: ./.github/workflows/_publish-runner.yml
+    with:
+      profile: oportunist
+      image: ghcr.io/pintjesb/oportunist-runner
+
+  version:
+    needs: publish
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_tag-semver.yml
     with:
       profile: oportunist
       image: ghcr.io/pintjesb/oportunist-runner
