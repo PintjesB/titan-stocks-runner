@@ -1,0 +1,268 @@
+name: publish-oportunist
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'runners/oportunist/**'
+      - '.github/workflows/publish-oportunist.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-oportunist-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/pintjesb/oportunist-runner
+
+jobs:
+  contract:
+    name: Oportunist runner contract
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: runners/oportunist
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Validate shell scripts
+        run: |
+          set -euo pipefail
+          while IFS= read -r script; do
+            bash -n "$script"
+            shellcheck -S warning "$script"
+          done < <(find scripts -type f -name '*.sh' -print)
+      - name: Validate Compose model
+        run: docker compose --env-file .env.example config >/dev/null
+      - name: Validate expected lean profile
+        run: |
+          set -euo pipefail
+          grep -q '@openai/codex' Dockerfile
+          grep -q 'docker-compose-v2' Dockerfile
+          grep -q 'python3' Dockerfile
+          ! grep -qi 'playwright' Dockerfile
+          ! grep -qi 'chromium' Dockerfile
+          ! grep -qi 'postgresql-client' Dockerfile
+          grep -q 'oportunist-runner-codex' docker-compose.yml
+
+  build:
+    name: Build and probe Oportunist ${{ matrix.platform }}
+    needs: contract
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            suffix: amd64
+            expected_arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+            expected_arch: arm64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push native candidate
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ./runners/oportunist
+          file: ./runners/oportunist/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:candidate-${{ github.sha }}-${{ matrix.suffix }}
+      - name: Resolve candidate digest
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:candidate-${GITHUB_SHA}-${{ matrix.suffix }}"
+          digest="$(docker buildx imagetools inspect "$ref" | awk '$1 == "Digest:" {print $2; exit}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          printf '%s\n' "$digest" > "$RUNNER_TEMP/candidate-digest.txt"
+      - name: Probe native candidate
+        run: |
+          set -euo pipefail
+          digest="$(cat "$RUNNER_TEMP/candidate-digest.txt")"
+          docker run --rm --platform "${{ matrix.platform }}" \
+            --entrypoint /usr/local/bin/probe \
+            --security-opt no-new-privileges:true \
+            --add-host host.docker.internal:host-gateway \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e EXPECTED_ARCH='${{ matrix.expected_arch }}' \
+            "${IMAGE}@${digest}" --skip-network
+      - name: Upload candidate digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oportunist-candidate-${{ matrix.suffix }}
+          path: ${{ runner.temp }}/candidate-digest.txt
+          if-no-files-found: error
+
+  merge:
+    name: Merge Oportunist native manifests
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download amd64 digest
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
+        with:
+          name: oportunist-candidate-amd64
+          path: ${{ runner.temp }}/amd64
+      - name: Download arm64 digest
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
+        with:
+          name: oportunist-candidate-arm64
+          path: ${{ runner.temp }}/arm64
+      - name: Merge exact candidate digests
+        run: |
+          set -euo pipefail
+          amd64="$(tr -d '[:space:]' < "$RUNNER_TEMP/amd64/candidate-digest.txt")"
+          arm64="$(tr -d '[:space:]' < "$RUNNER_TEMP/arm64/candidate-digest.txt")"
+          for digest in "$amd64" "$arm64"; do [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1; done
+          [ "$amd64" != "$arm64" ] || exit 1
+          docker buildx imagetools create --tag "${IMAGE}:candidate-${GITHUB_SHA}-merged" "${IMAGE}@${amd64}" "${IMAGE}@${arm64}"
+          merged="$(docker buildx imagetools inspect "${IMAGE}:candidate-${GITHUB_SHA}-merged" | awk '$1 == "Digest:" {print $2; exit}')"
+          [[ "$merged" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          printf '%s\n' "$merged" > "$RUNNER_TEMP/merged-digest.txt"
+      - name: Upload merged digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: oportunist-merged-digest
+          path: ${{ runner.temp }}/merged-digest.txt
+          if-no-files-found: error
+
+  verify:
+    name: Verify Oportunist ${{ matrix.platform }}
+    needs: merge
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            expected_arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            expected_arch: arm64
+    permissions:
+      contents: read
+    steps:
+      - name: Download merged digest
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
+        with:
+          name: oportunist-merged-digest
+          path: ${{ runner.temp }}
+      - name: Probe merged image
+        run: |
+          set -euo pipefail
+          digest="$(tr -d '[:space:]' < "$RUNNER_TEMP/merged-digest.txt")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          docker run --rm --platform "${{ matrix.platform }}" \
+            --entrypoint /usr/local/bin/probe \
+            --security-opt no-new-privileges:true \
+            --add-host host.docker.internal:host-gateway \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e EXPECTED_ARCH='${{ matrix.expected_arch }}' \
+            "${IMAGE}@${digest}" --skip-network
+
+  attest:
+    name: Attest Oportunist merged digest
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download merged digest
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
+        with:
+          name: oportunist-merged-digest
+          path: ${{ runner.temp }}
+      - name: Resolve digest
+        id: digest
+        run: |
+          digest="$(tr -d '[:space:]' < "$RUNNER_TEMP/merged-digest.txt")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attach provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+  promote:
+    name: Promote Oportunist latest
+    needs: attest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download merged digest
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
+        with:
+          name: oportunist-merged-digest
+          path: ${{ runner.temp }}
+      - name: Promote exact digest
+        run: |
+          set -euo pipefail
+          merged="$(tr -d '[:space:]' < "$RUNNER_TEMP/merged-digest.txt")"
+          [[ "$merged" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}@${merged}"
+          latest="$(docker buildx imagetools inspect "${IMAGE}:latest" | awk '$1 == "Digest:" {print $2; exit}')"
+          [ "$latest" = "$merged" ] || { echo "::error::latest digest $latest differs from merged $merged"; exit 1; }
+          echo "published ${IMAGE}@${latest}"
