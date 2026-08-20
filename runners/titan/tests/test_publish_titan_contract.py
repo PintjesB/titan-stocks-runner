@@ -9,6 +9,8 @@ PROFILE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROFILE_ROOT.parents[1]
 WRAPPER = REPO_ROOT / ".github" / "workflows" / "publish-titan.yml"
 REUSABLE = REPO_ROOT / ".github" / "workflows" / "_publish-runner.yml"
+SEMVER = REPO_ROOT / ".github" / "workflows" / "_tag-semver.yml"
+VERSION_FILE = PROFILE_ROOT / "VERSION"
 
 
 def _yaml(path: Path) -> dict:
@@ -27,11 +29,12 @@ def test_titan_wrapper_targets_profile_and_existing_image_name() -> None:
 def test_titan_wrapper_republishes_when_shared_workflow_changes() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
     assert "'.github/workflows/_publish-runner.yml'" in text
+    assert "'.github/workflows/_tag-semver.yml'" in text
     assert "'runners/titan/**'" in text
 
 
 def test_workflows_parse_and_have_no_executable_fixed_host_ports() -> None:
-    for path in (WRAPPER, REUSABLE):
+    for path in (WRAPPER, REUSABLE, SEMVER):
         data = _yaml(path)
         assert isinstance(data, dict), f"{path.name} must parse as a YAML mapping"
         assert "jobs" in data, f"{path.name} must declare jobs"
@@ -116,3 +119,37 @@ def test_reusable_publisher_attests_before_exact_promotion() -> None:
     assert "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6" in text
     assert '"${IMAGE}@${merged}"' in text
     assert '[ "$latest" != "$merged" ]' in text
+
+
+def test_titan_semver_job_runs_only_after_verified_publish() -> None:
+    data = _yaml(WRAPPER)
+    version_job = data["jobs"]["version"]
+    assert version_job["needs"] == "publish"
+    assert version_job["uses"] == "./.github/workflows/_tag-semver.yml"
+    assert version_job["with"]["profile"] == "titan"
+    assert version_job["with"]["image"] == "ghcr.io/pintjesb/titan-stocks-runner"
+
+
+def test_profile_version_floor_is_valid_semver_core() -> None:
+    import re
+
+    value = VERSION_FILE.read_text(encoding="utf-8").strip()
+    assert re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value)
+
+
+def test_semver_workflow_uses_ghcr_as_independent_release_ledger() -> None:
+    text = SEMVER.read_text(encoding="utf-8")
+    assert 'version_file="runners/${PROFILE}/VERSION"' in text
+    assert "/packages/container/${encoded_package}/versions?per_page=100" in text
+    assert "gh api --paginate" in text
+    assert "current_digest_patches" in text
+    assert "highest + 1" in text
+    assert "max(floor_patch, highest + 1)" in text
+
+
+def test_semver_tagging_is_idempotent_and_collision_safe() -> None:
+    text = SEMVER.read_text(encoding="utf-8")
+    assert "Re-running the same successfully published image is idempotent" in text
+    assert "version collision:" in text
+    assert '"${IMAGE}@${EXPECTED_DIGEST}"' in text
+    assert "latest moved during SemVer tagging" in text
