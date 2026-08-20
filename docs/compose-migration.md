@@ -22,7 +22,13 @@ volumes:
 
 The existing `titan-runner-state`, `titan-runner-work`, and `titan-runner-browser` volume names are unchanged, so adopting the current Compose file reuses the existing GitHub registration, workspace, and browser cache.
 
-If the old deployment pins an image digest, update `TITAN_RUNNER_IMAGE` to the newly published digest after the image pipeline succeeds. A digest pin never moves automatically. If the deployment uses `:latest`, run `docker compose pull` before recreating the runner.
+Runner releases now publish independent SemVer tags in addition to `latest`. Prefer an explicit version in `.env`, for example:
+
+```text
+TITAN_RUNNER_IMAGE=ghcr.io/pintjesb/titan-stocks-runner:1.0.0
+```
+
+This keeps deployments predictable while allowing Renovate to propose image upgrades automatically. If the deployment uses `:latest`, run `docker compose pull` before recreating the runner; `latest` moving in GHCR does not restart a running container by itself.
 
 After deployment, authenticate Codex once:
 
@@ -42,6 +48,12 @@ Use `runners/oportunist/docker-compose.yml` rather than adapting the Titan Compo
 - `oportunist-runner-work`
 - `oportunist-runner-codex`
 
+Use the profile's explicit SemVer image tag so Renovate can track upgrades:
+
+```text
+OPORTUNIST_RUNNER_IMAGE=ghcr.io/pintjesb/oportunist-runner:1.0.0
+```
+
 After first registration, clear `OPORTUNIST_RUNNER_TOKEN` from `.env` and recreate the container so the short-lived token is no longer present in Docker's stored container environment metadata.
 
 Authenticate Codex once with:
@@ -51,6 +63,12 @@ cd runners/oportunist
 docker compose exec --user runner runner codex login --device-auth
 docker compose exec --user runner runner codex login status
 ```
+
+## Versioning
+
+Titan and Oportunist version independently. Each profile's `VERSION` file defines the minimum SemVer on its current major/minor line. Successful publishes inspect the existing GHCR tags and add the next patch release, while re-running an already-published digest reuses its existing SemVer tag.
+
+To deliberately start a new release line, update only that profile's `VERSION` file, for example `1.0.0` to `1.1.0` or `2.0.0`.
 
 ## Repository rename
 

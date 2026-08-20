@@ -21,3 +21,17 @@ grep -q 'oportunist-runner-state' docker-compose.yml
 grep -q 'oportunist-runner-work' docker-compose.yml
 grep -q 'oportunist-runner-codex' docker-compose.yml
 grep -q 'CODEX_HOME: /home/runner/.codex' docker-compose.yml
+
+grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' VERSION
+
+repo_root="$(cd ../.. && pwd)"
+wrapper="$repo_root/.github/workflows/publish-oportunist.yml"
+semver="$repo_root/.github/workflows/_tag-semver.yml"
+
+grep -q 'uses: ./\.github/workflows/_tag-semver.yml' "$wrapper"
+grep -q 'profile: oportunist' "$wrapper"
+grep -q 'image: ghcr.io/pintjesb/oportunist-runner' "$wrapper"
+grep -q 'needs: publish' "$wrapper"
+grep -q 'version_file="runners/${PROFILE}/VERSION"' "$semver"
+grep -q 'gh api --paginate' "$semver"
+grep -q 'version collision:' "$semver"
