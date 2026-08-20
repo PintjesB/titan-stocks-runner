@@ -1,0 +1,40 @@
+name: validate-runner-profiles
+
+on:
+  pull_request:
+    paths:
+      - 'runners/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - titan
+          - oportunist
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Install contract dependencies
+        working-directory: runners/${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          if [ -f tests/requirements.txt ]; then
+            python3 -m pip install --quiet --upgrade pip
+            python3 -m pip install --quiet --requirement tests/requirements.txt
+          fi
+      - name: Run profile contract
+        working-directory: runners/${{ matrix.profile }}
+        run: ./ci-contract.sh
