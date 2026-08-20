@@ -6,6 +6,7 @@ on:
     paths:
       - 'runners/titan/**'
       - '.github/workflows/_publish-runner.yml'
+      - '.github/workflows/_tag-semver.yml'
       - '.github/workflows/publish-titan.yml'
   workflow_dispatch:
 
@@ -24,6 +25,16 @@ jobs:
       attestations: write
       artifact-metadata: write
     uses: ./.github/workflows/_publish-runner.yml
+    with:
+      profile: titan
+      image: ghcr.io/pintjesb/titan-stocks-runner
+
+  version:
+    needs: publish
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_tag-semver.yml
     with:
       profile: titan
       image: ghcr.io/pintjesb/titan-stocks-runner
