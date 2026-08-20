@@ -1,0 +1,49 @@
+services:
+  runner:
+    image: ${OPORTUNIST_RUNNER_IMAGE:?OPORTUNIST_RUNNER_IMAGE is required}
+    container_name: oportunist-runner
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      REPO_URL: ${OPORTUNIST_RUNNER_REPO_URL:-https://github.com/PintjesB/oportunist}
+      RUNNER_NAME: ${OPORTUNIST_RUNNER_NAME:-oportunist-ci}
+      RUNNER_LABELS: ${OPORTUNIST_RUNNER_LABELS:-oportunist-ci,codex}
+      RUNNER_TOKEN: ${OPORTUNIST_RUNNER_TOKEN:-}
+      RUNNER_STATE_DIR: /var/lib/oportunist-runner/state
+      RUNNER_RUNTIME_DIR: /var/lib/oportunist-runner/runtime
+      RUNNER_WORK_DIR: /var/lib/oportunist-runner/work
+      RUNNER_ROOT: /opt/actions-runner
+      CODEX_HOME: /home/runner/.codex
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - oportunist-runner-state:/var/lib/oportunist-runner/state
+      - oportunist-runner-work:/var/lib/oportunist-runner/work
+      - oportunist-runner-codex:/home/runner/.codex
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pgrep -u runner -f 'Runner.Listener' >/dev/null && gosu runner docker info >/dev/null 2>&1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 2m
+    stop_grace_period: 30s
+    networks:
+      - oportunist-runner-net
+
+networks:
+  oportunist-runner-net:
+    name: oportunist-runner-net
+    driver: bridge
+
+volumes:
+  oportunist-runner-state:
+    name: oportunist-runner-state
+  oportunist-runner-work:
+    name: oportunist-runner-work
+  oportunist-runner-codex:
+    name: oportunist-runner-codex
