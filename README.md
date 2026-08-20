@@ -2,7 +2,7 @@
 
 Central repository for the self-hosted GitHub Actions runner images operated by PintjesB.
 
-The repository is intentionally organized by runner profile. Each profile owns its image, Compose deployment, lifecycle scripts, tests, and documentation so repositories can use only the capabilities they actually need.
+The repository is organized by runner profile. Each profile owns its image, Compose deployment, lifecycle scripts, tests, and documentation so repositories use only the capabilities they actually need.
 
 ## Runner profiles
 
@@ -21,17 +21,38 @@ runners/
     Dockerfile
     docker-compose.yml
     deploy.sh
+    ci-contract.sh
     scripts/
     tests/
     docs/
   oportunist/
     Dockerfile
     docker-compose.yml
+    ci-contract.sh
     scripts/
 .github/workflows/
+  _publish-runner.yml
   publish-titan.yml
   publish-oportunist.yml
+  validate.yml
+docs/
+  compose-migration.md
 ```
+
+## CI and publication
+
+Pull requests that touch runner profiles or workflow files run the profile contracts before merge. Publication uses one reusable hardened workflow for both images:
+
+1. Run the profile contract.
+2. Build native `linux/amd64` and `linux/arm64` candidates.
+3. Probe each candidate on a matching native hosted runner.
+4. Pass exact registry digests between jobs through workflow artifacts.
+5. Merge the exact candidate digests and validate the merged platform set.
+6. Probe the merged manifest on both native architectures.
+7. Attach provenance to the immutable merged digest.
+8. Promote that exact digest to `:latest` and verify the registry-served digest matches.
+
+The reusable workflow deliberately tolerates the known Buildx case where `imagetools create` can return non-zero after the registry accepted the manifest. The remote merged-manifest postcondition remains authoritative.
 
 ## Design rules
 
@@ -42,14 +63,8 @@ runners/
 - Images remain pinned and tested before publication.
 - The dedicated CI VM is the security boundary for runners that receive the host Docker socket.
 
-## Titan runner
+## Deployment migration
 
-The existing Titan runner lives under [`runners/titan/`](runners/titan/). See its [README](runners/titan/README.md) for deployment and operations.
+Existing runner containers do not stop because this source repository was reorganized or renamed. However, update deployment Compose files before adopting Codex or refreshing image pins. See [Compose migration after the runner repository split](docs/compose-migration.md).
 
-## Oportunist runner
-
-The Oportunist profile lives under [`runners/oportunist/`](runners/oportunist/). It intentionally omits Titan-only browser and PostgreSQL tooling while retaining Docker, Python, Node, GitHub CLI, and Codex.
-
-## Repository rename
-
-This repository is being prepared to become the central runner repository. Renaming the GitHub repository itself is intentionally separate from the file-layout change so GitHub redirects and GHCR image names can be handled explicitly.
+The repository has already been renamed to `PintjesB/github-runners`. GitHub redirects the old repository URL, while the GHCR image names intentionally remain unchanged.
