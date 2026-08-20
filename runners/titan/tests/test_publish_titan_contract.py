@@ -30,6 +30,29 @@ def test_titan_wrapper_republishes_when_shared_workflow_changes() -> None:
     assert "'runners/titan/**'" in text
 
 
+def test_workflows_parse_and_have_no_executable_fixed_host_ports() -> None:
+    for path in (WRAPPER, REUSABLE):
+        data = _yaml(path)
+        assert isinstance(data, dict), f"{path.name} must parse as a YAML mapping"
+        assert "jobs" in data, f"{path.name} must declare jobs"
+        for job_name, job in data["jobs"].items():
+            assert isinstance(job, dict), f"{path.name} job {job_name!r} must be a mapping"
+            for index, step in enumerate(job.get("steps", []), start=1):
+                assert isinstance(step, dict), (
+                    f"{path.name} job {job_name!r} step {index} must be a mapping"
+                )
+                assert step.get("run") or step.get("uses"), (
+                    f"{path.name} job {job_name!r} step {index} must declare run or uses"
+                )
+                run = step.get("run", "")
+                for line in run.splitlines():
+                    if line.lstrip().startswith("#"):
+                        continue
+                    assert "ports:" not in line, (
+                        f"{path.name} must not declare a fixed host port binding"
+                    )
+
+
 def test_reusable_publisher_runs_profile_contract_before_build() -> None:
     data = _yaml(REUSABLE)
     jobs = data["jobs"]
